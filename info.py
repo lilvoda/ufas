@@ -104,7 +104,7 @@ class SdpException(Exception):
 
 
 class SdpStruct(dict):
-    def __init__(self, data=None):
+    def __init__(self, data=None, _pack: bool = True):
         super().__init__()
         self.data = b''
         self.offset = 0
@@ -115,11 +115,12 @@ class SdpStruct(dict):
             self._unpack_from_binary()
         elif data is not None:
             super().update(data)
-            self._pack_to_binary()
+            if _pack:
+                self._pack_to_binary()
 
     def _pack_to_binary(self):
         self.data = bytes([SdpDataType.STRUCT_BEGIN.value << 4])
-        for tag, value in sorted(self.items()):
+        for tag, value in sorted(self.items(), key=lambda kv: (kv[0] if isinstance(kv[0], int) else 0, str(kv[0]))):
             self._pack(tag, value)
         self.data += bytes([SdpDataType.STRUCT_END.value << 4])
 
@@ -167,13 +168,13 @@ class SdpStruct(dict):
         elif isinstance(value, dict):
             if isinstance(value, SdpStruct):
                 self._pack_header(tag, SdpDataType.STRUCT_BEGIN)
-                for k, v in sorted(value.items()):
+                for k, v in sorted(value.items(), key=lambda kv: (kv[0] if isinstance(kv[0], int) else 0, str(kv[0]))):
                     self._pack(k, v)
                 self.data += bytes([SdpDataType.STRUCT_END.value << 4])
             else:
                 self._pack_header(tag, SdpDataType.DICT)
                 self.data += self._write_number(len(value))
-                for k, v in sorted(value.items()):
+                for k, v in sorted(value.items(), key=lambda kv: str(kv[0])):
                     self._pack(0, k)
                     self._pack(0, v)
         else:
@@ -184,6 +185,8 @@ class SdpStruct(dict):
             return
         if self.data[0] >> 4 == SdpDataType.STRUCT_BEGIN.value:
             self.offset = 1
+            if (self.data[0] & 0xF) == 15:
+                self._read_number()
             while self.offset < len(self.data):
                 tag, value = self._unpack()
                 if isinstance(value, SdpDataType) and value == SdpDataType.STRUCT_END:
@@ -191,9 +194,13 @@ class SdpStruct(dict):
                 self[tag] = value
 
     def _read_number(self) -> int:
+        if self.offset >= len(self.data):
+            raise SdpException("Unexpected EOF in varint")
         n = 1
         val = self.data[self.offset] & 0x7F
         while self.data[self.offset + n - 1] >= 0x80:
+            if n > 10 or self.offset + n >= len(self.data):
+                raise SdpException("Truncated or overflowed varint")
             val |= (self.data[self.offset + n] & 0x7F) << (7 * n)
             n += 1
         self.offset += n
@@ -205,7 +212,10 @@ class SdpStruct(dict):
 
         header = self.data[self.offset]
         tag = header & 0xF
-        data_type = SdpDataType(header >> 4)
+        try:
+            data_type = SdpDataType(header >> 4)
+        except ValueError:
+            raise SdpException(f"Unknown data type: {header >> 4}")
         self.offset += 1
 
         if tag == 15:
@@ -217,16 +227,22 @@ class SdpStruct(dict):
             return tag, -self._read_number()
         elif data_type == SdpDataType.FLOAT:
             length = self._read_number()
+            if length != 4 or self.offset + length > len(self.data):
+                raise SdpException("Invalid float length")
             value = struct.unpack("<f", self.data[self.offset:self.offset + length])[0]
             self.offset += length
             return tag, value
         elif data_type == SdpDataType.DOUBLE:
             length = self._read_number()
+            if length != 8 or self.offset + length > len(self.data):
+                raise SdpException("Invalid double length")
             value = struct.unpack("<d", self.data[self.offset:self.offset + length])[0]
             self.offset += length
             return tag, value
         elif data_type == SdpDataType.STRING:
             length = self._read_number()
+            if self.offset + length > len(self.data):
+                raise SdpException("Truncated string")
             raw = self.data[self.offset:self.offset + length]
             self.offset += length
             try:
@@ -235,27 +251,38 @@ class SdpStruct(dict):
                 return tag, raw
         elif data_type == SdpDataType.LIST:
             length = self._read_number()
+            if length > len(self.data) - self.offset:
+                raise SdpException("Truncated list")
             value = []
             for _ in range(length):
+                if self.offset >= len(self.data):
+                    break
                 _, item = self._unpack()
                 value.append(item)
             return tag, value
         elif data_type == SdpDataType.DICT:
             length = self._read_number()
+            if length > len(self.data) - self.offset:
+                raise SdpException("Truncated dict")
             value = {}
             for _ in range(length):
+                if self.offset >= len(self.data):
+                    break
                 _, k = self._unpack()
+                if self.offset >= len(self.data):
+                    break
                 _, v = self._unpack()
-                value[k] = v
+                if isinstance(k, (int, str, bytes, float, tuple)):
+                    value[k] = v
             return tag, value
         elif data_type == SdpDataType.STRUCT_BEGIN:
             struct_data = {}
-            while True:
+            while self.offset < len(self.data):
                 sub_tag, sub_value = self._unpack()
                 if isinstance(sub_value, SdpDataType) and sub_value == SdpDataType.STRUCT_END:
                     break
                 struct_data[sub_tag] = sub_value
-            return tag, SdpStruct(struct_data)
+            return tag, SdpStruct(struct_data, _pack=False)
         elif data_type == SdpDataType.STRUCT_END:
             return tag, SdpDataType.STRUCT_END
         else:
@@ -394,7 +421,7 @@ def format_timestamp_full(timestamp: int) -> str:
 
 
 def extract_player_data(result, role_info=None, creation_ts=0) -> Optional[Dict]:
-    if not result or not result[0] or len(result[0]) == 0:
+    if not isinstance(result, dict) or not result.get(0) or len(result[0]) == 0:
         return None
     try:
         player = result[0][0]
@@ -410,14 +437,14 @@ def extract_player_data(result, role_info=None, creation_ts=0) -> Optional[Dict]
         location = "NOT FOUND"
         loc_data = player.get(71)
         if loc_data and isinstance(loc_data, list) and len(loc_data) >= 2:
-            location = ", ".join(loc_data)
+            location = ", ".join(str(x) for x in loc_data)
 
         last_login = player.get(5, 0)
         last_login_country = player.get(87, "Unknown")
         create_account_country = player.get(97, "Unknown")
 
         squad_icon = player.get(31, "")
-        squad_name = player.get(30, "").replace("`", "").strip()
+        squad_name = str(player.get(30, "") or "").replace("`", "").strip()
         squad = f"{squad_icon} {squad_name}".strip() if squad_name else "—"
 
         squad_id = 0
@@ -756,20 +783,15 @@ class DeviceManager:
         with self.lock:
             if not self.devices:
                 return None
-            max_attempts = min(100, len(self.devices))
-            for _ in range(max_attempts):
-                device = random.choice(self.devices)
-                if device != exclude_device and device not in self.failed_devices:
-                    self.device_usage[device] += 1
-                    return device
-
-            if self.failed_devices:
+            avail = [d for d in self.devices if d != exclude_device and d not in self.failed_devices]
+            if not avail and self.failed_devices:
                 self.failed_devices.clear()
-                device = random.choice(self.devices)
-                if device != exclude_device:
-                    self.device_usage[device] += 1
-                    return device
-            return None
+                avail = [d for d in self.devices if d != exclude_device]
+            if not avail:
+                avail = list(self.devices)
+            device = random.choice(avail)
+            self.device_usage[device] += 1
+            return device
 
     def mark_device_failure(self, device_id: str):
         with self.lock:
@@ -812,6 +834,7 @@ class BaseConnection:
                 pass
             self.socket = None
             self.sequence = 1
+        self.queue_data = b''
 
     def send_data(self, cmd_id: int, sdp: SdpStruct):
         packet = SdpStruct({0: cmd_id, 1: self.sequence, 5: sdp.data}).data
@@ -835,6 +858,7 @@ class BaseConnection:
             size = flags & 0xFFFFFF
             compression_type = flags >> 24
             if size < 4 or size > 16 * 1024 * 1024:
+                self.queue_data = b''
                 return None, None
 
             wait_count = 0
@@ -842,12 +866,14 @@ class BaseConnection:
                 try:
                     data = self.socket.recv(4096)
                     if not data:
+                        self.queue_data = b''
                         return None, None
                     self.queue_data += data
                     wait_count = 0
                 except socket.timeout:
                     wait_count += 1
-                    if wait_count >= 1:
+                    if wait_count >= 2:
+                        self.queue_data = b''
                         return -1, None
 
             data = self.queue_data[4:size]
@@ -857,17 +883,24 @@ class BaseConnection:
                 data = zlib.decompress(data)
             elif compression_type == 16:
                 data = zstd.decompress(data)
-            elif compression_type == 2:
+            elif compression_type in (2, 3, 18):
+                blk = len(data) - (len(data) % 16)
+                if blk <= 0:
+                    return None, None
                 cipher = AES.new(AES_KEY, AES.MODE_CBC, iv=AES_IV)
-                data = cipher.decrypt(data[:-1] if len(data) % 16 else data).rstrip(b'\x00')
-            elif compression_type == 3:
-                cipher = AES.new(AES_KEY, AES.MODE_CBC, iv=AES_IV)
-                data = cipher.decrypt(data[:-1] if len(data) % 16 else data).rstrip(b'\x00')
-                data = zlib.decompress(data)
-            elif compression_type == 18:
-                cipher = AES.new(AES_KEY, AES.MODE_CBC, iv=AES_IV)
-                dec = cipher.decrypt(data[:-1] if len(data) % 16 else data)
-                data = zstd.decompress(dec.rstrip(b'\x00'))
+                raw_dec = cipher.decrypt(data[:blk])
+                if compression_type == 2:
+                    data = raw_dec.rstrip(b'\x00')
+                elif compression_type == 3:
+                    try:
+                        data = zlib.decompress(raw_dec)
+                    except zlib.error:
+                        data = zlib.decompress(raw_dec.rstrip(b'\x00'))
+                else:
+                    try:
+                        data = zstd.decompress(raw_dec.rstrip(b'\x00'))
+                    except Exception:
+                        data = zstd.ZstdDecompressor().decompressobj().decompress(raw_dec)
 
             result = SdpStruct(data)
             cmd = result.get(0)
@@ -1027,8 +1060,10 @@ class GameConnection(BaseConnection):
                     if cmd == -1:
                         timeout_count += 1
                         continue
-                    if cmd == 10208 and res:
-                        return res
+                    if cmd == 10208:
+                        if res and res.get(2):
+                            return res
+                        break
         except Exception:
             pass
         return None
@@ -1041,10 +1076,10 @@ class GameConnection(BaseConnection):
             return None, None
 
         highest_role = None
-        highest_level = 0
+        highest_level = -1
 
         for role in role_list:
-            if isinstance(role, SdpStruct):
+            if isinstance(role, dict):
                 zone = role.get(0, 0)
                 rid = role.get(1, 0)
                 lvl = role.get(3, 0)
@@ -1069,7 +1104,7 @@ class GameConnection(BaseConnection):
                     break
                 if cmd == -1:
                     timeout_count += 1
-                    break
+                    continue
                 if cmd == 11154:
                     return res
         except Exception:
@@ -1086,7 +1121,7 @@ class GameConnection(BaseConnection):
                     break
                 if cmd == -1:
                     timeout_count += 1
-                    break
+                    continue
                 if cmd == 10144:
                     return res
         except Exception:
@@ -1115,17 +1150,25 @@ def get_player_info(
     (2) fetch full role_detail/role_info via real character devices in devices.txt."""
     result = None
     role_id, zone_id = None, None
+    deadline = time.monotonic() + 13.5  # ponytail: exit before browser.py 15s wait_for so executor threads never leak
     resolver_devs = [d for d in device_manager.devices if len(d) >= 88] or [_SESSION_RESOLVER_DEVICE]
     for rdev in resolver_devs[:3]:
+        if time.monotonic() >= deadline:
+            break
         rconn: Optional[GameConnection] = None
         try:
             rconn = GameConnection(device_id=rdev, device_manager=device_manager)
             rconn.connect()
             if not (rconn.login_to_login_server() and rconn.get_game_server() and rconn.connect_to_game_server()):
                 continue
-            result = rconn.get_account_info(guid, session, "and") or rconn.get_account_info(guid, session, "ios")
-            if result:
-                role_id, zone_id = rconn.get_highest_level_role(result)
+            for atype in ("and", "ios"):
+                cand = rconn.get_account_info(guid, session, atype)
+                if cand:
+                    rid, zid = rconn.get_highest_level_role(cand)
+                    if rid:
+                        result, role_id, zone_id = cand, rid, zid
+                        break
+            if role_id:
                 break
         except Exception:
             pass
@@ -1138,6 +1181,8 @@ def get_player_info(
 
     used_devices: List[str] = []
     for attempt in range(1, max_device_retries + 1):
+        if time.monotonic() >= deadline:
+            break
         exclude = used_devices[-1] if used_devices else None
         device_id = device_manager.get_next_device(exclude)
         if not device_id:

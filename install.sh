@@ -10,7 +10,7 @@ LIC_KEY="${1:-${CLOAKBROWSER_LICENSE_KEY:-$KEY_DEFAULT}}"
 echo "[*] MLBB Fast Checker — First-time Installer"
 
 # Detect raw Android Termux (bionic libc cannot execute linux-arm64 glibc Chromium binaries)
-if [ -n "${TERMUX_VERSION:-}" ] && [ ! -f /etc/os-release ]; then
+if [ -n "${TERMUX_VERSION:-}" ] && { [ ! -f /etc/os-release ] || [ "${PREFIX:-}" = "/data/data/com.termux/files/usr" ]; }; then
     echo "[!] Termux native (bionic) terdeteksi."
     echo "    CloakBrowser butuh glibc (linux-arm64). Jalankan lewat Ubuntu proot-distro:"
     echo "      pkg update && pkg install -y proot-distro"
@@ -24,24 +24,28 @@ if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
     SUDO="sudo"
 fi
 
-# 1. System base packages (Python3 + venv + pip)
-if command -v apt-get >/dev/null 2>&1; then
-    echo "[*] Memasang paket dasar apt (python3, venv, pip, curl)..."
-    $SUDO apt-get update -y
-    $SUDO apt-get install -y python3 python3-venv python3-pip curl ca-certificates
-elif command -v dnf >/dev/null 2>&1; then
-    $SUDO dnf install -y python3 python3-pip curl ca-certificates
-elif command -v pacman >/dev/null 2>&1; then
-    $SUDO pacman -Sy --noconfirm python python-pip curl ca-certificates
+# 1. System base packages (Python3 + venv + pip) — hanya jika belum lengkap dan punya akses root/sudo
+if ! command -v python3 >/dev/null 2>&1 || ! python3 -m venv --help >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
+    if [ "$(id -u)" -eq 0 ] || [ -n "$SUDO" ]; then
+        if command -v apt-get >/dev/null 2>&1; then
+            echo "[*] Memasang paket dasar apt (python3, venv, pip, curl)..."
+            $SUDO apt-get update -y
+            $SUDO apt-get install -y python3 python3-venv python3-pip curl ca-certificates
+        elif command -v dnf >/dev/null 2>&1; then
+            $SUDO dnf install -y python3 python3-pip curl ca-certificates
+        elif command -v pacman >/dev/null 2>&1; then
+            $SUDO pacman -S --needed --noconfirm python python-pip curl ca-certificates
+        fi
+    fi
 fi
 
-if ! command -v python3 >/dev/null 2>&1; then
-    echo "[!] python3 tidak ditemukan. Pasang Python 3.10+ terlebih dahulu."
+if ! command -v python3 >/dev/null 2>&1 || ! python3 -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)" 2>/dev/null; then
+    echo "[!] Python 3.10+ diperlukan (versi saat ini terlalu lama atau belum terpasang)."
     exit 1
 fi
 
 # 2. Virtualenv (.venv) agar aman terhadap PEP 668 di Ubuntu/Debian modern
-if [ ! -d ".venv" ]; then
+if [ ! -f ".venv/bin/activate" ]; then
     echo "[*] Membuat virtualenv .venv..."
     python3 -m venv .venv
 fi
@@ -55,7 +59,7 @@ python -m pip install --upgrade cloakbrowser playwright pycryptodome zstandard c
 # 3. Dependensi library OS untuk Chromium/CloakBrowser (Linux)
 if [ "$(uname -s)" = "Linux" ]; then
     echo "[*] Memasang library sistem Chromium (playwright install-deps)..."
-    if ! python -m playwright install-deps chromium; then
+    if ! python -m playwright install-deps chromium && [ -n "$SUDO" ]; then
         $SUDO env "PATH=$PATH" python -m playwright install-deps chromium || true
     fi
 fi

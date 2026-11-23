@@ -104,4 +104,27 @@ assert "timeout=8" in inspect.getsource(browser.send_tg), "send_tg urlopen timeo
 assert "fail_count >= 6" in src_main, "Cascade restart threshold should be >= 6"
 assert "accountmtapi.mobilelegends.com" in inspect.getsource(browser._probe_proxy_ms), "API latency probe missing"
 assert "cutoff_ms" in inspect.getsource(browser.test_proxies), "Abnormal latency cutoff missing"
+assert "stale_browser" in src_main and "last_relaunch" in src_main, "Thundering-herd relaunch guard missing"
+assert "browser_state['active'] == 0" in src_worker and "acct_retries" in src_worker, "Safe recycle / persistent retry guard missing"
+assert "reason == 'periodic_rotate' and inflight_tabs" not in src_worker, "_recover_ctx must wait for inflight_tabs on all recovery types"
+_bc = _info.BaseConnection("127.0.0.1", 30021)
+_bc.queue_data = b"leftover"
+_bc.cleanup()
+assert _bc.queue_data == b"", "BaseConnection.cleanup must clear queue_data"
+# Truncated STRUCT_BEGIN and truncated varint must terminate cleanly without infinite loop
+_trunc = _info.SdpStruct(bytes([(_info.SdpDataType.STRUCT_BEGIN.value << 4), (_info.SdpDataType.STRUCT_BEGIN.value << 4) | 1]))
+assert isinstance(_trunc, dict)
+try:
+    _info.SdpStruct(bytes([(_info.SdpDataType.STRUCT_BEGIN.value << 4), 0x0F, 0x80]))
+    assert False, "Truncated varint should raise SdpException"
+except _info.SdpException:
+    pass
+# Multi-agent audit regression assertions
+assert "'err_' not in err_low and 'net::' not in err_low" in src_worker, "Proxy net::ERR_ errors must never relaunch shared browser"
+assert "code >= 500" in inspect.getsource(browser._probe_proxy_ms), "5xx gateway errors must be rejected in proxy probe"
+assert "except Exception:" not in inspect.getsource(browser._touch), "_touch must not swallow CDP errors from _human_drag"
+assert browser.parse_proxy("http://u__cr.sg,my:p@gw.dataimpulse.com:823")["username"] == "u__cr.sg,my", "Multi-country comma in proxy username must be preserved"
+_dm1 = _info.DeviceManager("__nonexistent_devices__.txt")
+assert _dm1.get_next_device(_dm1.devices[0]) == _dm1.devices[0], "1-device fallback pool must not return None on retry"
+assert _info.extract_player_data({1: "no_zero_key"}) is None, "extract_player_data missing key 0 must not raise KeyError"
 print("All hybrid browser stability, 2-tab, cache, license & lookup checks passed.")
