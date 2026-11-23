@@ -17,13 +17,14 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE, "names_db.json")
 SEEN_DB_PATH = os.path.join(BASE, "combo_seen.db")
 
-PREFIXES = ("its", "itz", "itss", "iam", "im", "the", "real", "pro")
-TAGS = ("gaming", "gamer", "yt", "tv", "ml", "mlbb", "pro", "official", "vip")
-ACRONYM_TAGS = {"yt", "tv", "ml", "mlbb", "vip"}
-NUMS = tuple(str(i) for i in range(1, 10)) + tuple(f"{i:02d}" for i in range(100))
-SPECIAL_NUMS = ("100", "123", "143", "321", "404", "420", "515", "520", "666", "777", "888", "999", "007", "1234", "13579")
-YEARS = tuple(str(y) for y in range(1990, 2010)) + tuple(str(y) for y in range(2020, 2027))
-SUFFIXES = tuple(dict.fromkeys(NUMS + SPECIAL_NUMS + YEARS))
+TAGS = ("gaming", "tzy", "gg", "pro", "gamer", "official", "yt")
+ACRONYM_TAGS = {"gg", "yt"}
+NUMS_2D = tuple(f"{i:02d}" for i in range(100))
+NUMS_1D = tuple(str(i) for i in range(1, 10))
+HOT_NUMS = ("18", "99", "88", "12", "10", "19", "21", "04", "93", "16", "23", "01", "94", "77", "69", "07", "13", "20", "22", "24")
+SPECIAL_NUMS = ("123", "1234", "6969", "321", "100", "420", "777", "888", "999", "515", "520", "007")
+YEARS = tuple(str(y) for y in range(2020, 2027)) + tuple(str(y) for y in range(1995, 2010))
+SUFFIXES = tuple(dict.fromkeys(HOT_NUMS + NUMS_2D + NUMS_1D + SPECIAL_NUMS + YEARS))
 VALID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]{5,19}$")
 
 
@@ -143,24 +144,18 @@ def gen_pass(user: str) -> str:
     cap = user[0].upper() + user[1:].lower()
     r = random.random()
     if not user[-1].isdigit():
-        if r < 0.45:
-            pw = cap
-        elif r < 0.70 and len(cap) <= 17:
-            pw = cap + "123"
-        elif r < 0.85:
-            pw = user
-        elif r < 0.94:
-            pw = user.lower()
-        else:
-            extra = random.choice(("1234", "01", "12", "99"))
-            pw = cap + extra if len(cap) + len(extra) <= 20 else cap
-    elif r < 0.72:
-        pw = cap
-    elif r < 0.92:
-        pw = user
-    else:
-        pw = user.lower()
-    return pw
+        if r < 0.58:
+            return cap
+        if r < 0.86 and len(cap) <= 17:
+            return cap + "123"
+        if r < 0.95:
+            return user
+        return user.lower()
+    if r < 0.90:
+        return cap
+    if r < 0.97:
+        return user
+    return user.lower()
 
 
 def _pick_suffix(base: str, options: tuple[str, ...] = SUFFIXES) -> str:
@@ -182,55 +177,60 @@ def _pick_pair(pool: list[str]) -> tuple[str, str]:
     return (n1, random.choice(others)) if others else (n1, "")
 
 
-def make_username(pools: list[list[str]], weights: list[int], wide: bool = False) -> str:
-    pool = random.choices(pools, weights=weights, k=1)[0]
+def make_username(
+    pools: list[list[str]],
+    weights: list[int],
+    wide: bool = False,
+    short_pools: list[list[str]] | None = None,
+) -> str:
+    idx = random.choices(range(len(pools)), weights=weights, k=1)[0]
+    pool = pools[idx]
+    spool = short_pools[idx] if short_pools else pool
     r = random.random()
     allow_all_upper = False
 
-    if r < (0.30 if wide else 0.46):
-        # Name + angka/tahun realistis (misal: Rizky2002, Jhen16, Putrii99)
-        base = random.choice(pool)
-        sfx = _pick_suffix(base)
+    if r < (0.44 if wide else 0.70):
+        # Pola dominan (70%): nama pendek 4-6 huruf + 2 digit / tahun / 1 digit
+        base_pool = spool if (not wide and random.random() < 0.78) else pool
+        base = random.choice(base_pool)
+        rs = random.random()
+        if rs < 0.74:
+            opts = HOT_NUMS + NUMS_2D
+        elif rs < 0.86:
+            opts = YEARS[:7] + SPECIAL_NUMS[:5]  # 2020-2026, 123, 1234, 6969
+        elif rs < 0.94:
+            opts = NUMS_1D + NUMS_2D
+        else:
+            opts = SUFFIXES
+        sfx = _pick_suffix(base, opts)
         user = base + sfx if sfx else ""
         allow_all_upper = True
-    elif r < (0.68 if wide else 0.74) and len(pool) >= 2:
-        # First + Last dari negara sama, tanpa nama kembar + opsional angka/tahun
+    elif r < (0.68 if wide else 0.86):
+        # Gaming / kata dunia game (+ opsional 2 digit)
+        tag = random.choice(TAGS)
+        if random.random() < 0.70:
+            tag = tag.upper() if tag in ACRONYM_TAGS else (tag[0].upper() + tag[1:])
+        base = random.choice(spool if random.random() < 0.65 else pool)
+        user = base + tag
+        if len(user) < 6 or random.random() < (0.65 if wide else 0.35):
+            sfx = _pick_suffix(user, NUMS_2D + NUMS_1D + ("123",))
+            if sfx:
+                user += sfx
+    elif r < (0.86 if wide else 0.94) and len(pool) >= 2:
+        # First + Last satu negara & gender (+ opsional 2 digit)
         n1, n2 = _pick_pair(pool)
         user = n1 + n2 if n2 else ""
-        if user and (len(user) < 6 or random.random() < (0.55 if wide else 0.30)):
-            sfx = _pick_suffix(user, NUMS + SPECIAL_NUMS)
-            if sfx:
-                user += sfx
-    elif r < (0.82 if wide else 0.86):
-        # Prefix natural + Name (+ opsional angka)
-        pfx = random.choice(PREFIXES)
-        name = random.choice(pool)
-        if name.lower().startswith(pfx):
-            return ""
-        if random.random() < 0.35:
-            pfx = pfx[0].upper() + pfx[1:]
-        user = pfx + name
-        if len(user) < 6 or random.random() < (0.55 if wide else 0.30):
-            sfx = _pick_suffix(user, NUMS + SPECIAL_NUMS)
-            if sfx:
-                user += sfx
-    elif r < (0.91 if wide else 0.94):
-        # Name + tag gamer/MLBB (+ opsional angka)
-        tag = random.choice(TAGS)
-        if random.random() < 0.65:
-            tag = tag.upper() if tag in ACRONYM_TAGS else (tag[0].upper() + tag[1:])
-        user = random.choice(pool) + tag
-        if len(user) < 6 or random.random() < (0.55 if wide else 0.25):
-            sfx = _pick_suffix(user, NUMS)
+        if user and (len(user) < 6 or random.random() < (0.60 if wide else 0.35)):
+            sfx = _pick_suffix(user, NUMS_2D + NUMS_1D)
             if sfx:
                 user += sfx
     else:
-        # Inisial + Nama / Nama + Inisial + angka (misal: MRizky02, PutriA99)
+        # Inisial + Nama / Nama + Inisial + 2 digit (misal: MRizky02, PutriA99)
         n1, n2 = _pick_pair(pool) if len(pool) >= 2 else (random.choice(pool), "")
         if n2:
             base = (n1[0].upper() + n2) if random.random() < 0.5 else (n1 + n2[0].upper())
-            sfx = _pick_suffix(base) if (len(base) < 6 or random.random() < 0.85) else ""
-            user = base + sfx
+            sfx = _pick_suffix(base, NUMS_2D + SPECIAL_NUMS[:3])
+            user = base + sfx if sfx else base
         else:
             base = random.choice(pool)
             user = base + _pick_suffix(base)
@@ -239,9 +239,9 @@ def make_username(pools: list[list[str]], weights: list[int], wide: bool = False
         return ""
 
     rc = random.random()
-    if allow_all_upper and rc < 0.08:
+    if allow_all_upper and rc < 0.04:
         return user.upper()
-    if rc < 0.34:
+    if rc < 0.14:
         return user.lower()
     return user
 
@@ -254,6 +254,7 @@ def generate_combos(
     gender: str = "all",
 ) -> list[str]:
     _, pools, weights = load_names_db(db_path, countries=countries, gender=gender, split_gender=True)
+    short_pools = [[x for x in p if 3 <= len(x) <= 6] or p for p in pools]
     seen = load_seen_set(seen_db) if seen_db else set()
     new_keys = []
     out = []
@@ -261,7 +262,7 @@ def generate_combos(
     attempts = 0
     while len(out) < count and attempts < max_attempts:
         attempts += 1
-        user = make_username(pools, weights, wide=(attempts > count * 2))
+        user = make_username(pools, weights, wide=(attempts > count * 2), short_pools=short_pools)
         if not VALID_RE.fullmatch(user):
             continue
         k = user.lower()
