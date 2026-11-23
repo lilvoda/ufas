@@ -74,4 +74,25 @@ assert "extract_player_data(role_detail, role_info, 0)" in inspect.getsource(_in
 assert "size < 4" in inspect.getsource(_info.BaseConnection.recv_data)
 _ep = _info.extract_player_data({0: [{0: 1, 1: 1, 2: "X", 3: 10, 83: 5}]}, {24: "motto_not_int"}, 0)
 assert _ep and _ep["data"]["extra_info"]["likes"] == 0
+
+# 8. Universal terminal UI adaptation (wide, narrow, short, CJK clip, ANSI/ASCII fallback)
+import io, os as _os, shutil as _shutil, sys as _sys
+_old_tui, _old_out, _old_gts = browser._TUI_ACTIVE, _sys.stdout, _shutil.get_terminal_size
+try:
+    browser._TUI_ACTIVE = True
+    browser.stats.update({'total': 1000, 'checked': 42, 'valid': 1, 'start': 1.0, 'workers': 4, 'workers_total': 5, 'proxy_label': 'very_long_proxy_file_name_12345.txt'})
+    browser._TOP_HITS[:] = ["verylongaccountname123:verylongpassword123 | Lv69 | 124 Skins | Mythical Immortal 150"]
+    for cols, rows in ((120, 40), (80, 24), (50, 18), (42, 12)):
+        buf = io.StringIO()
+        _sys.stdout = buf
+        _shutil.get_terminal_size = lambda fallback=(80, 24), _c=cols, _r=rows: _os.terminal_size((_c, _r))
+        browser.render_dashboard(force=True)
+        frame = buf.getvalue().replace("\033[H", "").replace("\033[J", "")
+        lines = [ln.replace("\033[K", "") for ln in frame.split("\n")]
+        assert len(lines) <= rows, f"Frame height {len(lines)} > {rows} at {cols}x{rows}"
+        assert all(browser._vis_len(ln) <= cols for ln in lines), f"Line overflow at {cols}x{rows}"
+finally:
+    browser._TUI_ACTIVE, _sys.stdout, _shutil.get_terminal_size = _old_tui, _old_out, _old_gts
+    browser._TOP_HITS.clear()
+
 print("All hybrid browser stability, 2-tab, cache, license & lookup checks passed.")

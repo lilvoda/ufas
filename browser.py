@@ -20,10 +20,12 @@ import math
 import os
 import random
 import re
+import shutil
 import signal
 import subprocess
 import sys
 import time
+import unicodedata
 import zlib
 # ponytail: unshadow stdlib http for urllib.request, then restore script dir so info.py imports
 _script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -141,9 +143,13 @@ def _emergency_cleanup():
 
 atexit.register(_emergency_cleanup)
 
+_ORIG_ENC = (getattr(sys.stdout, 'encoding', None) or '').lower()
 for _s in (sys.stdout, sys.stderr):
     try:
-        _s.reconfigure(encoding='utf-8', errors='backslashreplace')
+        if os.name == 'nt' or 'utf' in _ORIG_ENC:
+            _s.reconfigure(encoding='utf-8', errors='backslashreplace')
+        else:
+            _s.reconfigure(errors='backslashreplace')
     except Exception:
         pass
 
@@ -224,9 +230,29 @@ FILES = {
     'ERR': 'err.txt'
 }
 
-# ── UI & Color Styling (proxy.py style) ───────────────────────────────────────
-RESET = '\033[0m'; DIM = '\033[2m'; BD = '\033[1m'
-def rgb(r, g, b): return f"\033[38;2;{r};{g};{b}m"
+# ── UI & Color Styling (universal terminal compatible) ───────────────────────
+_IS_TTY = bool(getattr(sys.stdout, 'isatty', lambda: False)())
+_TERM = os.environ.get('TERM', '').lower()
+_NO_COLOR = bool(os.environ.get('NO_COLOR')) or _TERM == 'dumb'
+_COLOR_OK = (not _NO_COLOR) and (_IS_TTY or bool(os.environ.get('FORCE_COLOR')))
+if os.name == 'nt' and _COLOR_OK:
+    os.system('')  # Enable VT100 on Windows conhost even without colorama
+_TRUECOLOR = _COLOR_OK and (
+    os.environ.get('COLORTERM', '').lower() in ('truecolor', '24bit')
+    or bool(os.environ.get('WT_SESSION'))
+)
+_LC_RAW = (os.environ.get('LC_ALL') or os.environ.get('LC_CTYPE') or os.environ.get('LANG') or '').upper()
+_LC = _LC_RAW.split('.')[0]
+_POSIX_UTF_ENV = (os.name == 'nt') or ('UTF' in _LC_RAW) or (not _LC_RAW and 'utf' in _ORIG_ENC)
+_UTF_OK = (
+    not bool(os.environ.get('NO_UTF8'))
+    and ('--ascii' not in sys.argv)
+    and ('utf' in (getattr(sys.stdout, 'encoding', None) or '').lower())
+    and _POSIX_UTF_ENV
+    and _TERM not in ('linux', 'vt100', 'vt220', 'vt102', 'ansi', 'dumb', '')
+    and _LC not in ('C', 'POSIX')
+)
+
 CYAN   = (75, 220, 255)
 PURPLE = (175, 95, 255)
 GREEN  = (80, 235, 155)
@@ -234,8 +260,33 @@ GOLD   = (255, 205, 80)
 RED    = (255, 85, 105)
 WHITE  = (238, 242, 255)
 GRAY   = (125, 135, 160)
-G = '\033[92m'; R = '\033[91m'; Y = '\033[93m'; W = '\033[0m'
+_ANSI16 = {
+    CYAN: '\033[96m', PURPLE: '\033[95m', GREEN: '\033[92m',
+    GOLD: '\033[93m', RED: '\033[91m', WHITE: '\033[97m', GRAY: '\033[90m',
+}
+
+RESET = '\033[0m' if _COLOR_OK else ''
+DIM = '\033[2m' if _COLOR_OK else ''
+BD = '\033[1m' if _COLOR_OK else ''
+G = '\033[92m' if _COLOR_OK else ''
+R = '\033[91m' if _COLOR_OK else ''
+Y = '\033[93m' if _COLOR_OK else ''
+W = '\033[0m' if _COLOR_OK else ''
+
+def rgb(r, g, b):
+    if not _COLOR_OK:
+        return ''
+    if _TRUECOLOR:
+        return f"\033[38;2;{r};{g};{b}m"
+    return _ANSI16.get((r, g, b), '')
+
 def c(co): return rgb(*co)
+
+BT, BTR, BBL, BBR, BH, BV, ST, STR, SBL, SBR, BAR_F, BAR_E, S_OK, S_ERR, S_STAR, S_ASK, S_YN = (
+    ('╭', '╮', '╰', '╯', '─', '│', '┌', '┐', '└', '┘', '█', '░', '✓', '✗', '★', '◈', '❯')
+    if _UTF_OK else
+    ('+', '+', '+', '+', '-', '|', '+', '+', '+', '+', '#', '.', '+', 'x', '*', '>', '>')
+)
 
 def p_out(t, end="\n"):
     try:
@@ -244,7 +295,10 @@ def p_out(t, end="\n"):
         print(t.encode("ascii", "ignore").decode(), end=end, flush=True)
 
 def clear_line():
-    p_out("\033[2K\r", end="")
+    if _COLOR_OK:
+        p_out("\033[2K\r", end="")
+    elif _IS_TTY:
+        p_out("\r", end="")
 
 def now():
     return datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -287,15 +341,60 @@ def _fmt_bytes(b: int) -> str:
     if b < 1073741824: return f"{b/1048576:.2f} MB"
     return f"{b/1073741824:.2f} GB"
 
+def _char_w(ch: str) -> int:
+    if unicodedata.combining(ch):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1
+
 def _vis_len(s: str) -> int:
-    return len(_ANSI_RE.sub('', s))
+    return sum(_char_w(ch) for ch in _ANSI_RE.sub('', s))
+
+def _clip_ansi(s: str, w: int) -> str:
+    if w <= 0 or _vis_len(s) <= w:
+        return s if w > 0 else ''
+    out, cur, i, has_ansi = [], 0, 0, False
+    while i < len(s):
+        m = _ANSI_RE.match(s, i)
+        if m:
+            out.append(m.group(0))
+            has_ansi = True
+            i = m.end()
+            continue
+        cw = _char_w(s[i])
+        if cur + cw > w:
+            break
+        out.append(s[i])
+        cur += cw
+        i += 1
+    if has_ansi and W:
+        out.append(W)
+    return ''.join(out)
 
 def _pad(s: str, w: int) -> str:
-    n = w - _vis_len(s)
-    return s + (' ' * max(0, n))
+    clipped = _clip_ansi(s, w)
+    return clipped + (' ' * max(0, w - _vis_len(clipped)))
 
 def _box_line(inner: str, w: int = 68, bc: tuple = RED) -> str:
-    return f"{c(bc)}│{W} {_pad(inner, w - 4)} {c(bc)}│{W}"
+    return f"{c(bc)}{BV}{W} {_pad(inner, max(1, w - 4))} {c(bc)}{BV}{W}"
+
+def _print_box(title: str, lines: list[str], bc: tuple = CYAN, indent: str = "  ") -> None:
+    cols = shutil.get_terminal_size((80, 24)).columns
+    w = max(42, min(68, cols - len(indent) - 1))
+    inner_w = w - 2
+    if title:
+        t_vis = f" {title} "
+        tl = _vis_len(t_vis)
+        left_d = max(1, (inner_w - tl) // 2) if tl < inner_w - 2 else 1
+        right_d = max(1, inner_w - tl - left_d)
+        top = f"{indent}{c(bc)}{BT}{BH * left_d}{W}{t_vis}{c(bc)}{BH * right_d}{BTR}{W}"
+    else:
+        top = f"{indent}{c(bc)}{BT}{BH * inner_w}{BTR}{W}"
+    p_out("")
+    p_out(top)
+    for ln in lines:
+        p_out(f"{indent}{_box_line(ln, w, bc)}")
+    p_out(f"{indent}{c(bc)}{BBL}{BH * inner_w}{BBR}{W}")
+    p_out("")
 
 def render_dashboard(force: bool = False):
     global _LAST_RENDER
@@ -306,7 +405,8 @@ def render_dashboard(force: bool = False):
         return
     _LAST_RENDER = now_t
 
-    W_OUT = 68
+    term_cols, term_rows = shutil.get_terminal_size((80, 24))
+    W_OUT = max(40, min(68, term_cols - 1))
     W_IN = W_OUT - 4
     el = int(max(now_t - stats['start'], 0))
     el_str = f"{el // 3600}:{(el % 3600) // 60:02d}:{el % 60:02d}"
@@ -316,86 +416,109 @@ def render_dashboard(force: bool = False):
 
     st = stats['status']
     if st == 'WAF_WAIT':
-        badge = f"\033[41;97m ! WAF / ROTATE \033[0m"
+        badge = "\033[41;97m ! WAF / ROTATE \033[0m" if _COLOR_OK else "[! WAF]"
     elif st == 'DONE':
-        badge = f"\033[42;30m + FINISHED \033[0m"
+        badge = "\033[42;30m + FINISHED \033[0m" if _COLOR_OK else "[+ DONE]"
     else:
-        badge = f"\033[42;30m * RUNNING \033[0m"
+        badge = "\033[42;30m * RUNNING \033[0m" if _COLOR_OK else "[* RUN]"
 
-    bar_w = 34
+    bar_w = max(8, min(34, W_IN - 30))
     filled = int(pct / 100 * bar_w)
-    pbar = f"{c(RED)}{'█'*filled}{c(GRAY)}{'░'*(bar_w-filled)}{W}"
-    prog_str = f" {pbar}  {c(GOLD)}{pct:5.1f}%{W}  {c(WHITE)}{ck:,}/{tot:,}{W}  {c(CYAN)}{rate:.1f}/s{W}"
+    pbar = f"{c(RED)}{BAR_F * filled}{c(GRAY)}{BAR_E * (bar_w - filled)}{W}"
+    prog_str = f" {pbar} {c(GOLD)}{pct:5.1f}%{W} {c(WHITE)}{ck:,}/{tot:,}{W} {c(CYAN)}{rate:.1f}/s{W}"
 
     out_lines = []
-    # Top outer border: exact 68 chars
-    title = f" * {c(PURPLE)}{BD}MLBB FAST CHECKER v9.0{W} {c(CYAN)}@BrowserEngine{W} * "
+    title = (
+        f" * {c(PURPLE)}{BD}MLBB FAST CHECKER v9.0{W} {c(CYAN)}@BrowserEngine{W} * "
+        if W_OUT >= 54 else
+        f" {c(PURPLE)}{BD}MLBB CHECKER v9.0{W} "
+    )
+    title = _clip_ansi(title, W_OUT - 4)
     tl = _vis_len(title)
     top_inner = W_OUT - 2
-    left_d = (top_inner - tl) // 2
-    right_d = top_inner - tl - left_d
-    out_lines.append(f"{c(RED)}╭{'─'*left_d}{title}{c(RED)}{'─'*right_d}╮{W}")
+    left_d = max(0, (top_inner - tl) // 2)
+    right_d = max(0, top_inner - tl - left_d)
+    out_lines.append(f"{c(RED)}{BT}{BH * left_d}{title}{c(RED)}{BH * right_d}{BTR}{W}")
 
     # Row 1: Elapsed | Workers | Status
-    hdr_left = _pad(f"  {c(WHITE)}elapsed {el_str}{W}     {c(GREEN)}* {stats['workers']}/{stats.get('workers_total', stats['workers'])} workers{W}", W_IN - _vis_len(badge))
+    w_live, w_tot = stats['workers'], stats.get('workers_total', stats['workers'])
+    hdr_left = _pad(f" {c(WHITE)}elapsed {el_str}{W}  {c(GREEN)}* {w_live}/{w_tot} workers{W}", max(1, W_IN - _vis_len(badge)))
     out_lines.append(_box_line(f"{hdr_left}{badge}", W_OUT))
 
-    # Row 2: Compact Proxy + Real-Time Quota bar
+    # Row 2: Compact Proxy + Real-Time Quota
     q_str = _fmt_bytes(stats['bytes_used'])
-    px_txt = f"  {c(GRAY)}Proxy:{W} {c(CYAN)}{stats['proxy_label'][:26]}{W} {c(GRAY)}│ CTX:{W} {c(PURPLE)}{stats['proxy_ctx']}{W} {c(GRAY)}│ Quota:{W} {c(GOLD)}{q_str}{W}"
+    px_max = max(8, W_IN - 32)
+    px_txt = f" {c(GRAY)}Proxy:{W} {c(CYAN)}{stats['proxy_label'][:px_max]}{W} {c(GRAY)}{BV} CTX:{W} {c(PURPLE)}{stats['proxy_ctx']}{W} {c(GRAY)}{BV} Quota:{W} {c(GOLD)}{q_str}{W}"
     out_lines.append(_box_line(px_txt, W_OUT))
 
     # Row 3: Progress box
-    out_lines.append(_box_line(f"{c(GOLD)}┌{'─'*(W_IN-2)}┐{W}", W_OUT))
-    out_lines.append(_box_line(f"{c(GOLD)}│{W}{_pad(prog_str, W_IN-2)}{c(GOLD)}│{W}", W_OUT))
-    out_lines.append(_box_line(f"{c(GOLD)}└{'─'*(W_IN-2)}┘{W}", W_OUT))
+    out_lines.append(_box_line(f"{c(GOLD)}{ST}{BH * (W_IN - 2)}{STR}{W}", W_OUT))
+    out_lines.append(_box_line(f"{c(GOLD)}{BV}{W}{_pad(prog_str, W_IN - 2)}{c(GOLD)}{BV}{W}", W_OUT))
+    out_lines.append(_box_line(f"{c(GOLD)}{SBL}{BH * (W_IN - 2)}{SBR}{W}", W_OUT))
 
-    # Row 4: Two-column STATS + TIER (5 inner rows)
-    LW = 29
-    RW = W_IN - LW - 1
-    l_title = f"- {c(CYAN)}STATS{W}{c(PURPLE)} -"
-    r_title = f"- {c(CYAN)}TIER / PEAK{W}{c(PURPLE)} -"
-    out_lines.append(_box_line(
-        f"{c(PURPLE)}┌{'─'*6}{l_title}{'─'*(LW-8-_vis_len('- STATS -'))}┐{W} "
-        f"{c(PURPLE)}┌{'─'*6}{r_title}{'─'*(RW-8-_vis_len('- TIER / PEAK -'))}┐{W}", W_OUT
-    ))
-    stat_rows = [
-        (f" {c(GRAY)}TOTAL{W}",     f"{c(WHITE)}{ck:,}{W}",                f" {c(GRAY)}MYTHIC+{W}",    f"{c(GOLD)}{stats['rank_mythic']}{W}"),
-        (f" {c(GRAY)}VALID{W}",     f"{c(GREEN)}{stats['valid']:,}{W}",     f" {c(GRAY)}LEGEND/EPIC{W}",f"{c(PURPLE)}{stats['rank_legend']}/{stats['rank_epic']}{W}"),
-        (f" {c(GRAY)}INVALID{W}",   f"{c(RED)}{stats['invalid']:,}{W}",     f" {c(GRAY)}WAF SOLVE{W}",  f"{c(CYAN)}{stats['waf_solved']:,}{W}"),
-        (f" {c(GRAY)}2FA / OTP{W}", f"{c(GOLD)}{stats['otp']:,}{W}",        f" {c(GRAY)}WAF HITS{W}",   f"{c(PURPLE)}{stats['waf']:,}{W}"),
-        (f" {c(GRAY)}ERROR{W}",     f"{c(GRAY)}{stats['error']:,}{W}",      f" {c(GRAY)}PEAK SKINS{W}", f"{c(GOLD)}{stats['peak_skins'] or 'N/A'}{W}"),
-    ]
-    for lk, lv, rk, rv in stat_rows:
-        l_cell = _pad(f"{_pad(lk, 16)}{lv}", LW - 2)
-        r_cell = _pad(f"{_pad(rk, 17)}{rv}", RW - 2)
-        out_lines.append(_box_line(f"{c(PURPLE)}│{W}{l_cell}{c(PURPLE)}│{W} {c(PURPLE)}│{W}{r_cell}{c(PURPLE)}│{W}", W_OUT))
-    out_lines.append(_box_line(f"{c(PURPLE)}└{'─'*(LW-2)}┘{W} {c(PURPLE)}└{'─'*(RW-2)}┘{W}", W_OUT))
-
-    # Row 5: Top Hits box
-    th_title = f" {c(GOLD)}TOP HITS{W} "
-    th_d = (W_IN - 2 - _vis_len(" TOP HITS ")) // 2
-    out_lines.append(_box_line(f"{c(GOLD)}┌{'─'*th_d}{th_title}{c(GOLD)}{'─'*(W_IN-2-th_d-_vis_len(' TOP HITS '))}┐{W}", W_OUT))
-    if not _TOP_HITS:
-        empty_th = f"{' '*19}{c(GRAY)}No valid hits yet{W}"
-        out_lines.append(_box_line(f"{c(GOLD)}│{W}{_pad(empty_th, W_IN-2)}{c(GOLD)}│{W}", W_OUT))
+    # Row 4: Stats (2-col on W_OUT >= 62, compact 1-col on narrow terminals)
+    if W_OUT >= 62:
+        LW = 29
+        RW = W_IN - LW - 1
+        l_title = f"- {c(CYAN)}STATS{W}{c(PURPLE)} -"
+        r_title = f"- {c(CYAN)}TIER / PEAK{W}{c(PURPLE)} -"
+        ld_r = max(1, LW - 8 - _vis_len('- STATS -'))
+        rd_r = max(1, RW - 8 - _vis_len('- TIER / PEAK -'))
+        out_lines.append(_box_line(
+            f"{c(PURPLE)}{ST}{BH * 6}{l_title}{BH * ld_r}{STR}{W} "
+            f"{c(PURPLE)}{ST}{BH * 6}{r_title}{BH * rd_r}{STR}{W}", W_OUT
+        ))
+        stat_rows = [
+            (f" {c(GRAY)}TOTAL{W}",     f"{c(WHITE)}{ck:,}{W}",                f" {c(GRAY)}MYTHIC+{W}",    f"{c(GOLD)}{stats['rank_mythic']}{W}"),
+            (f" {c(GRAY)}VALID{W}",     f"{c(GREEN)}{stats['valid']:,}{W}",     f" {c(GRAY)}LEGEND/EPIC{W}",f"{c(PURPLE)}{stats['rank_legend']}/{stats['rank_epic']}{W}"),
+            (f" {c(GRAY)}INVALID{W}",   f"{c(RED)}{stats['invalid']:,}{W}",     f" {c(GRAY)}WAF SOLVE{W}",  f"{c(CYAN)}{stats['waf_solved']:,}{W}"),
+            (f" {c(GRAY)}2FA / OTP{W}", f"{c(GOLD)}{stats['otp']:,}{W}",        f" {c(GRAY)}WAF HITS{W}",   f"{c(PURPLE)}{stats['waf']:,}{W}"),
+            (f" {c(GRAY)}ERROR{W}",     f"{c(GRAY)}{stats['error']:,}{W}",      f" {c(GRAY)}PEAK SKINS{W}", f"{c(GOLD)}{stats['peak_skins'] or 'N/A'}{W}"),
+        ]
+        for lk, lv, rk, rv in stat_rows:
+            l_cell = _pad(f"{_pad(lk, 16)}{lv}", LW - 2)
+            r_cell = _pad(f"{_pad(rk, 17)}{rv}", RW - 2)
+            out_lines.append(_box_line(f"{c(PURPLE)}{BV}{W}{l_cell}{c(PURPLE)}{BV}{W} {c(PURPLE)}{BV}{W}{r_cell}{c(PURPLE)}{BV}{W}", W_OUT))
+        out_lines.append(_box_line(f"{c(PURPLE)}{SBL}{BH * (LW - 2)}{SBR}{W} {c(PURPLE)}{SBL}{BH * (RW - 2)}{SBR}{W}", W_OUT))
     else:
-        for th in _TOP_HITS[:1]:
-            out_lines.append(_box_line(f"{c(GOLD)}│{W}{_pad(' ' + th, W_IN-2)}{c(GOLD)}│{W}", W_OUT))
-    out_lines.append(_box_line(f"{c(GOLD)}└{'─'*(W_IN-2)}┘{W}", W_OUT))
+        out_lines.append(_box_line(
+            f" {c(GREEN)}OK:{stats['valid']}{W} {c(RED)}INV:{stats['invalid']}{W} "
+            f"{c(GOLD)}2FA:{stats['otp']}{W} {c(GRAY)}ERR:{stats['error']}{W}", W_OUT
+        ))
+        out_lines.append(_box_line(
+            f" {c(GOLD)}MYT:{stats['rank_mythic']}{W} {c(PURPLE)}WAF:{stats['waf_solved']}/{stats['waf']}{W} "
+            f"{c(GOLD)}SKIN:{stats['peak_skins'] or 0}{W}", W_OUT
+        ))
 
-    # Row 6: Live Log box (4 rows -> total frame = 23 lines, fits 24-row terminals with zero scroll)
-    ll_title = f" {c(PURPLE)}LIVE LOG{W} "
-    ll_d = (W_IN - 2 - _vis_len(" LIVE LOG ")) // 2
-    out_lines.append(_box_line(f"{c(PURPLE)}┌{'─'*ll_d}{ll_title}{c(PURPLE)}{'─'*(W_IN-2-ll_d-_vis_len(' LIVE LOG '))}┐{W}", W_OUT))
-    log_snapshot = list(_LIVE_LOGS)
-    for row_i in range(4):
-        entry = log_snapshot[row_i] if row_i < len(log_snapshot) else ""
-        out_lines.append(_box_line(f"{c(PURPLE)}│{W}{_pad(entry, W_IN-2)}{c(PURPLE)}│{W}", W_OUT))
-    out_lines.append(_box_line(f"{c(PURPLE)}└{'─'*(W_IN-2)}┘{W}", W_OUT))
+    # Adapt TOP HITS and LIVE LOG row count to terminal height so frame never scrolls
+    avail_rows = term_rows - len(out_lines) - 2
+    show_top = bool(_TOP_HITS) and avail_rows >= 3 or avail_rows >= 7
+    if show_top:
+        th_title = f" {c(GOLD)}TOP HITS{W} "
+        th_d = max(1, (W_IN - 2 - _vis_len(" TOP HITS ")) // 2)
+        th_r = max(1, W_IN - 2 - th_d - _vis_len(" TOP HITS "))
+        out_lines.append(_box_line(f"{c(GOLD)}{ST}{BH * th_d}{th_title}{c(GOLD)}{BH * th_r}{STR}{W}", W_OUT))
+        if not _TOP_HITS:
+            pad_c = ' ' * max(0, (W_IN - 2 - 17) // 2)
+            out_lines.append(_box_line(f"{c(GOLD)}{BV}{W}{_pad(pad_c + c(GRAY) + 'No valid hits yet' + W, W_IN - 2)}{c(GOLD)}{BV}{W}", W_OUT))
+        else:
+            out_lines.append(_box_line(f"{c(GOLD)}{BV}{W}{_pad(' ' + _TOP_HITS[0], W_IN - 2)}{c(GOLD)}{BV}{W}", W_OUT))
+        out_lines.append(_box_line(f"{c(GOLD)}{SBL}{BH * (W_IN - 2)}{SBR}{W}", W_OUT))
+        avail_rows -= 3
 
-    # Bottom outer border
-    out_lines.append(f"{c(RED)}╰{'─'*(W_OUT-2)}╯{W}")
+    log_rows = max(0, min(4, avail_rows - 2))
+    if log_rows > 0:
+        ll_title = f" {c(PURPLE)}LIVE LOG{W} "
+        ll_d = max(1, (W_IN - 2 - _vis_len(" LIVE LOG ")) // 2)
+        ll_r = max(1, W_IN - 2 - ll_d - _vis_len(" LIVE LOG "))
+        out_lines.append(_box_line(f"{c(PURPLE)}{ST}{BH * ll_d}{ll_title}{c(PURPLE)}{BH * ll_r}{STR}{W}", W_OUT))
+        log_snapshot = list(_LIVE_LOGS)[-log_rows:]
+        for row_i in range(log_rows):
+            entry = log_snapshot[row_i] if row_i < len(log_snapshot) else ""
+            out_lines.append(_box_line(f"{c(PURPLE)}{BV}{W}{_pad(entry, W_IN - 2)}{c(PURPLE)}{BV}{W}", W_OUT))
+        out_lines.append(_box_line(f"{c(PURPLE)}{SBL}{BH * (W_IN - 2)}{SBR}{W}", W_OUT))
+
+    out_lines.append(f"{c(RED)}{BBL}{BH * (W_OUT - 2)}{BBR}{W}")
 
     out_buf = "\033[H" + "\n".join(ln + "\033[K" for ln in out_lines) + "\033[J"
     try:
@@ -413,9 +536,9 @@ def print_result(rtype, email, password, msg=""):
     if len(acc) > 26:
         acc = acc[:23] + "..."
     if rtype == "INVALID":
-        _LIVE_LOGS.append(f" {c(GRAY)}{idx:>4}{W}  {c(RED)}✗{W}  {c(GRAY)}{_pad(acc, 26)}{W} {c(RED)}{msg[:22]}{W}")
+        _LIVE_LOGS.append(f" {c(GRAY)}{idx:>4}{W}  {c(RED)}{S_ERR}{W}  {c(GRAY)}{_pad(acc, 26)}{W} {c(RED)}{msg[:22]}{W}")
     elif rtype == "OTP":
-        _LIVE_LOGS.append(f" {c(GRAY)}{idx:>4}{W}  {c(GOLD)}★{W}  {c(WHITE)}{_pad(acc, 26)}{W} {c(GOLD)}2FA {msg[:18]}{W}")
+        _LIVE_LOGS.append(f" {c(GRAY)}{idx:>4}{W}  {c(GOLD)}{S_STAR}{W}  {c(WHITE)}{_pad(acc, 26)}{W} {c(GOLD)}2FA {msg[:18]}{W}")
     elif rtype in ("ERR", "WAF", "ERROR"):
         _LIVE_LOGS.append(f" {c(GRAY)}{idx:>4}{W}  {c(GRAY)}!{W}  {c(GRAY)}{_pad(acc, 26)}{W} {c(GRAY)}{(msg or 'Timeout')[:22]}{W}")
     if not _TUI_ACTIVE:
@@ -454,8 +577,8 @@ def print_hit(email, password, d, info=None):
     if len(acc) > 26:
         acc = acc[:23] + "..."
     detail = f"Lv{lvl} {skins}Skins" if (lvl or skins) else tier_label
-    _LIVE_LOGS.append(f" {c(GRAY)}{idx:>4}{W}  {c(GREEN)}✓{W}  {c(GREEN)}{_pad(acc, 26)}{W} {c(GREEN)}{detail[:26]}{W}")
-    _TOP_HITS.insert(0, f"{c(GREEN)}{email}:{password}{W} {c(GOLD)}│ Lv{lvl} │ {skins} Skins │ {rank or tier_label}{W}")
+    _LIVE_LOGS.append(f" {c(GRAY)}{idx:>4}{W}  {c(GREEN)}{S_OK}{W}  {c(GREEN)}{_pad(acc, 26)}{W} {c(GREEN)}{detail[:26]}{W}")
+    _TOP_HITS.insert(0, f"{c(GREEN)}{email}:{password}{W} {c(GOLD)}{BV} Lv{lvl} {BV} {skins} Skins {BV} {rank or tier_label}{W}")
     del _TOP_HITS[5:]
 
     if not _TUI_ACTIVE:
@@ -1921,9 +2044,9 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
 
 # ── Interactive CLI Menu (checker.js style) ──────────────────────────────────
 def ask(label: str, default: str = '') -> str:
-    d = f" \033[90m[{default}]\033[0m" if default else ''
+    d = f" {c(GRAY)}[{default}]{W}" if default else ''
     try:
-        v = input(f"  \033[36m◈\033[0m {label}{d} \033[90m›\033[0m ").strip().strip('"').strip("'")
+        v = input(f"  {c(CYAN)}{S_ASK}{W} {label}{d} {c(GRAY)}{S_YN}{W} ").strip().strip('"').strip("'")
     except EOFError:
         v = ''
     return v or default
@@ -1931,7 +2054,7 @@ def ask(label: str, default: str = '') -> str:
 def ask_yn(label: str, default: str = 'y') -> bool:
     while True:
         try:
-            r = input(f"  \033[96m❯\033[0m {label} \033[90m(y/n)\033[0m  \033[95m❯\033[0m ").strip().lower()
+            r = input(f"  {c(CYAN)}{S_YN}{W} {label} {c(GRAY)}(y/n){W}  {c(PURPLE)}{S_YN}{W} ").strip().lower()
         except EOFError:
             r = ''
         if not r:
@@ -1955,6 +2078,7 @@ async def async_main():
     pa.add_argument('--no-proxy', action='store_true', default=False)
     pa.add_argument('--license-key', type=str, default='')
     pa.add_argument('--two-tab', action='store_true', default=False)
+    pa.add_argument('--ascii', action='store_true', help='Paksa UI pure ASCII (tanpa Unicode box drawing)')
     pa.add_argument('--selftest', action='store_true')
     args = pa.parse_args()
 
@@ -2015,13 +2139,12 @@ async def async_main():
         elif args.no_proxy:
             PROXY_ENABLED = False
     else:
-        os.system("cls" if os.name == "nt" else "clear")
-        p_out(f"""
-  {c(CYAN)}╭──────────────────────────────────────────────────────────────╮{W}
-  {c(CYAN)}│{W}                 {c(WHITE)}{BD}⚡ MLBB FAST CHECKER v9.0 ⚡{W}                 {c(CYAN)}│{W}
-  {c(CYAN)}│{W}        {c(GRAY)}Native Direct-Vue Bridge · Auto Aliyun Slider{W}         {c(CYAN)}│{W}
-  {c(CYAN)}╰──────────────────────────────────────────────────────────────╯{W}
-""")
+        if _IS_TTY:
+            os.system("cls" if os.name == "nt" else "clear")
+        _print_box("", [
+            f"  {c(WHITE)}{BD}* MLBB FAST CHECKER v9.0 *{W}",
+            f"  {c(GRAY)}Native Direct-Vue Bridge - Auto Aliyun Slider{W}",
+        ], bc=CYAN)
         default_combo = os.path.join(PROJECT_ROOT, 'Base', 'combo.txt')
         if not os.path.exists(default_combo):
             default_combo = os.path.join(BASE, 'combo.txt')
@@ -2069,14 +2192,12 @@ async def async_main():
     done_accounts = load_done()
     queue = [x for x in combos if x[0].lower() not in done_accounts]
 
-    p_out(f"""
-  {c(GRAY)}┌─ CONFIGURATION ──────────────────────────────────────────────┐{W}
-  {c(GRAY)}│{W}  {c(WHITE)}Queue   :{W} {c(GREEN)}{len(queue):,} accounts{W} {c(GRAY)}(total: {len(combos):,}, done: {len(done_accounts):,}){W}
-  {c(GRAY)}│{W}  {c(WHITE)}Workers :{W} {c(CYAN)}{NUM_CONTEXTS} browser contexts (Headless){W}
-  {c(GRAY)}│{W}  {c(WHITE)}Proxy   :{W} {c(GOLD)}{shortpath(PROXY_FILE) if PROXY_ENABLED else 'Direct Mode'}{W}
-  {c(GRAY)}│{W}  {c(WHITE)}Output  :{W} {c(GRAY)}{shortpath(OUTPUT_DIR)}/{W}
-  {c(GRAY)}└──────────────────────────────────────────────────────────────┘{W}
-""")
+    _print_box("CONFIGURATION", [
+        f" {c(WHITE)}Queue   :{W} {c(GREEN)}{len(queue):,} accounts{W} {c(GRAY)}(tot:{len(combos):,}, done:{len(done_accounts):,}){W}",
+        f" {c(WHITE)}Workers :{W} {c(CYAN)}{NUM_CONTEXTS} browser contexts (Headless){W}",
+        f" {c(WHITE)}Proxy   :{W} {c(GOLD)}{shortpath(PROXY_FILE) if PROXY_ENABLED else 'Direct Mode'}{W}",
+        f" {c(WHITE)}Output  :{W} {c(GRAY)}{shortpath(OUTPUT_DIR)}/{W}",
+    ], bc=GRAY)
 
     if not queue:
         p_out(f"{c(GREEN)}[*] Semua akun pada file combo sudah selesai diperiksa.{W}")
@@ -2165,10 +2286,11 @@ async def async_main():
         stats['start'] = time.time()
         stats['workers_total'] = stats['workers'] = min(NUM_CONTEXTS, len(queue))
         stats['proxy_label'] = f"{os.path.basename(PROXY_FILE)} ({len(live_pool or [])} live)" if PROXY_ENABLED else "None (Direct)"
-        _TUI_ACTIVE = True
-        sys.stdout.write("\033[?1049h\033[?25l\033[2J\033[H")
-        sys.stdout.flush()
-        render_dashboard(force=True)
+        _TUI_ACTIVE = _IS_TTY and (_TERM != 'dumb')
+        if _TUI_ACTIVE:
+            sys.stdout.write("\033[?1049h\033[?25l\033[2J\033[H")
+            sys.stdout.flush()
+            render_dashboard(force=True)
 
         # asyncio.Queue: thread-safe, tidak ada race condition saat banyak worker
         # menarik combo secara bersamaan (tidak seperti shared iterator/next()).
@@ -2251,20 +2373,17 @@ async def async_main():
         _release_instance_lock(_inst_lock)
 
     el = max(time.time() - stats['start'], 1)
-    px = stats['proxy_ctx']
     ck = stats['checked']
-    p_out(f"""
-  {c(GREEN)}╭────────────────────── CHECK COMPLETE ──────────────────────╮{W}
-  {c(GREEN)}│{W}  {c(WHITE)}{BD}TOTAL CHECKED{W} : {ck:,} accounts
-  {c(GREEN)}│{W}  {c(GREEN)}{BD}✓ VALID HITS {W} : {stats['valid']:,}
-  {c(GREEN)}│{W}  {c(GOLD)}{BD}★ 2FA / OTP  {W} : {stats['otp']:,}
-  {c(GREEN)}│{W}  {c(RED)}{BD}✗ INVALID    {W} : {stats['invalid']:,}
-  {c(GREEN)}│{W}  {c(GRAY)}{BD}! ERRORS     {W} : {stats['error']:,}
-  {c(GREEN)}│{W}  {c(CYAN)}SPEED / TIME {W} : {ck/el:.2f} acc/s  ({int(el)}s elapsed)
-  {c(GREEN)}│{W}  {c(GOLD)}PROXY QUOTA  {W} : {_fmt_bytes(stats['bytes_used'])}  ({_fmt_bytes(int(stats['bytes_used']/max(ck,1)))}/acc)
-  {c(GREEN)}│{W}  {c(GRAY)}OUTPUT DIR   {W} : {shortpath(OUTPUT_DIR)}/
-  {c(GREEN)}╰────────────────────────────────────────────────────────────╯{W}
-""")
+    _print_box("CHECK COMPLETE", [
+        f" {c(WHITE)}{BD}TOTAL CHECKED{W} : {ck:,} accounts",
+        f" {c(GREEN)}{BD}{S_OK} VALID HITS {W} : {stats['valid']:,}",
+        f" {c(GOLD)}{BD}{S_STAR} 2FA / OTP  {W} : {stats['otp']:,}",
+        f" {c(RED)}{BD}{S_ERR} INVALID    {W} : {stats['invalid']:,}",
+        f" {c(GRAY)}{BD}! ERRORS     {W} : {stats['error']:,}",
+        f" {c(CYAN)}SPEED / TIME {W} : {ck/el:.2f} acc/s  ({int(el)}s)",
+        f" {c(GOLD)}PROXY QUOTA  {W} : {_fmt_bytes(stats['bytes_used'])} ({_fmt_bytes(int(stats['bytes_used']/max(ck,1)))}/acc)",
+        f" {c(GRAY)}OUTPUT DIR   {W} : {shortpath(OUTPUT_DIR)}/",
+    ], bc=GREEN)
 
 def main():
     try:
