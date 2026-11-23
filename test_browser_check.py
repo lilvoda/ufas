@@ -62,4 +62,16 @@ with tempfile.TemporaryDirectory() as tmpd:
 
 src_launch = inspect.getsource(browser.launch_browser_smart)
 assert "license_key=" in src_launch
+
+# 7. Audited bug regression checks (TUI _LIVE_LOGS str-only, empty proxy abort, WAF JSON guard, info.py fixes)
+browser._LIVE_LOGS.clear()
+browser.print_result("ERR", "worker-0", "sys", "restart #1")
+assert all(isinstance(x, str) for x in browser._LIVE_LOGS), "_LIVE_LOGS must contain strings only"
+assert "_LIVE_LOGS.append((" not in src_main, "worker_with_restart must not append raw tuples to _LIVE_LOGS"
+assert "if not raw_p:" in src_main, "Missing empty proxy file abort guard"
+assert "not body.startswith(\"{\")" in inspect.getsource(browser.do_fast_http_post)
+assert "extract_player_data(role_detail, role_info, 0)" in inspect.getsource(_info.get_player_info)
+assert "size < 4" in inspect.getsource(_info.BaseConnection.recv_data)
+_ep = _info.extract_player_data({0: [{0: 1, 1: 1, 2: "X", 3: 10, 83: 5}]}, {24: "motto_not_int"}, 0)
+assert _ep and _ep["data"]["extra_info"]["likes"] == 0
 print("All hybrid browser stability, 2-tab, cache, license & lookup checks passed.")

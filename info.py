@@ -386,7 +386,7 @@ def format_timestamp_full(timestamp: int) -> str:
     try:
         if timestamp == 0:
             return "N/A"
-        utc_dt = datetime.datetime.utcfromtimestamp(timestamp)
+        utc_dt = datetime.datetime.fromtimestamp(timestamp, datetime.timezone.utc)
         pht_dt = utc_dt + datetime.timedelta(hours=8)
         return pht_dt.strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
@@ -458,9 +458,12 @@ def extract_player_data(result, role_info=None, creation_ts=0) -> Optional[Dict]
 
         likes = 0
         if role_info and isinstance(role_info, dict):
-            likes = role_info.get(24, 0)
+            _v24 = role_info.get(24, 0)
+            if isinstance(_v24, int):
+                likes = _v24
         if not likes:
-            likes = player.get(61, 0)
+            _v61 = player.get(61, 0)
+            likes = _v61 if isinstance(_v61, int) else 0
 
         _t111 = player.get(111, {})
         if isinstance(_t111, dict):
@@ -813,7 +816,7 @@ class BaseConnection:
         packet = SdpStruct({0: cmd_id, 1: self.sequence, 5: sdp.data}).data
         buf = zstd.compress(packet)
         flags = (len(buf) + 4) | (16 << 24)
-        self.socket.send(flags.to_bytes(4, 'big') + buf)
+        self.socket.sendall(flags.to_bytes(4, 'big') + buf)
         self.sequence += 1
 
     def recv_data(self) -> Tuple[Optional[int], Optional[SdpStruct]]:
@@ -830,6 +833,8 @@ class BaseConnection:
             flags = int.from_bytes(self.queue_data[:4], 'big')
             size = flags & 0xFFFFFF
             compression_type = flags >> 24
+            if size < 4 or size > 16 * 1024 * 1024:
+                return None, None
 
             wait_count = 0
             while len(self.queue_data) < size:
@@ -1166,7 +1171,7 @@ def get_player_info(
                     83: role_info.get(10, 0),
                 }]}
 
-            player_data = extract_player_data(role_detail, role_info, conn.creation_ts)
+            player_data = extract_player_data(role_detail, role_info, 0)
             if not player_data:
                 conn.cleanup()
                 continue
