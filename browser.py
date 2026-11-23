@@ -2360,7 +2360,6 @@ async def async_main():
         TWO_TAB = ask_yn("2-tab extra worker? (2 tab/context, lebih cepat)", default='y' if args.two_tab else 'n')
         HEADLESS = True  # ponytail: always headless
         DEBUG = False
-        OUTPUT_DIR = os.path.join(BASE, "output")
 
         # Proxy prompt: directly ask proxy file (empty = direct), no extra y/n prompts
         default_proxy = os.path.join(BASE, 'input', 'proxies.txt')
@@ -2386,9 +2385,8 @@ async def async_main():
             PROXY_ENABLED = False
 
     NUM_CONTEXTS = workers
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # Load combos & apply resume
+    # Load combos & apply per-input folder resume (output/<nama_file_input>/)
     if not os.path.isabs(combo_path):
         if os.path.exists(combo_path):
             combo_path = os.path.abspath(combo_path)
@@ -2396,6 +2394,10 @@ async def async_main():
             combo_path = os.path.join(BASE, 'input', combo_path)
         else:
             combo_path = os.path.join(BASE, combo_path)
+    if not args.out:
+        _stem = re.sub(r'[^A-Za-z0-9._-]+', '_', os.path.splitext(os.path.basename(combo_path))[0]).strip('._-') or 'default'
+        OUTPUT_DIR = os.path.join(BASE, 'output', _stem)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
     combos = load_combos(combo_path)
     done_accounts = load_done()
     queue = [x for x in combos if f"{x[0]}:{x[1]}".lower() not in done_accounts]

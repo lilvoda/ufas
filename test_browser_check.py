@@ -127,4 +127,5 @@ assert browser.parse_proxy("http://u__cr.sg,my:p@gw.dataimpulse.com:823")["usern
 _dm1 = _info.DeviceManager("__nonexistent_devices__.txt")
 assert _dm1.get_next_device(_dm1.devices[0]) == _dm1.devices[0], "1-device fallback pool must not return None on retry"
 assert _info.extract_player_data({1: "no_zero_key"}) is None, "extract_player_data missing key 0 must not raise KeyError"
+assert "os.path.join(BASE, 'output', _stem)" in src_main, "Per-input resume OUTPUT_DIR missing"
 print("All hybrid browser stability, 2-tab, cache, license & lookup checks passed.")
