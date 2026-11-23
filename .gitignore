@@ -2,7 +2,7 @@
 __pycache__/
 *.py[cod]
 output/
-gen/*.txt
+gen/
 combo_seen.db*
 _test_*/
 .chromium_cache/
