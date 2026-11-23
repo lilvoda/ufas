@@ -499,8 +499,9 @@ def extract_player_data(result, role_info=None, creation_ts=0) -> Optional[Dict]
         affinity_label = _AFFINITY_MAP.get(_aff_level, f"Level {_aff_level}") if _aff_level else "None"
 
         import time as _time
+        _now_ts = _time.time()
         _sl_expiry = player.get(50, 0)
-        if _sl_expiry and isinstance(_sl_expiry, int) and _sl_expiry > _time.time():
+        if _sl_expiry and isinstance(_sl_expiry, int) and _now_ts < _sl_expiry < _now_ts + 400 * 86400:
             starlight_user = "Yes ⭐"
         else:
             starlight_user = "No"
@@ -545,7 +546,7 @@ def extract_player_data(result, role_info=None, creation_ts=0) -> Optional[Dict]
         if not total_battles:
             total_battles = player.get(17, 0)
 
-        if total_battles > 0:
+        if isinstance(total_battles, int) and isinstance(win_count, int) and total_battles > 0 and 0 <= win_count <= total_battles:
             win_rate = f"{(win_count / total_battles * 100):.1f}%"
         else:
             win_rate = "N/A"

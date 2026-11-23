@@ -72,8 +72,10 @@ assert "if not raw_p:" in src_main, "Missing empty proxy file abort guard"
 assert "not body.startswith(\"{\")" in inspect.getsource(browser.do_fast_http_post)
 assert "extract_player_data(role_detail, role_info, 0)" in inspect.getsource(_info.get_player_info)
 assert "size < 4" in inspect.getsource(_info.BaseConnection.recv_data)
-_ep = _info.extract_player_data({0: [{0: 1, 1: 1, 2: "X", 3: 10, 83: 5}]}, {24: "motto_not_int"}, 0)
+_ep = _info.extract_player_data({0: [{0: 1, 1: 1, 2: "X", 3: 10, 83: 5, 50: 9999999999}]}, {24: "motto_not_int", 22: 200, 77: 100}, 0)
 assert _ep and _ep["data"]["extra_info"]["likes"] == 0
+assert _ep["data"]["extra_info"]["win_rate"] == "N/A"
+assert _ep["data"]["extra_info"]["starlight_user"] == "No"
 
 # 8. Universal terminal UI adaptation (wide, narrow, short, CJK clip, ANSI/ASCII fallback)
 import io, os as _os, shutil as _shutil, sys as _sys
@@ -95,4 +97,7 @@ finally:
     browser._TUI_ACTIVE, _sys.stdout, _shutil.get_terminal_size = _old_tui, _old_out, _old_gts
     browser._TOP_HITS.clear()
 
+assert "tab0_done" in src_worker, "Tab 1 end-of-queue deadlock guard missing"
+assert "PROXY_HTTP_ERR" in src_login, "Fast proxy HTTP error wake missing"
+assert "browser_state" in src_main and "zero_evt" in src_main, "Periodic Chromium recycle gate missing"
 print("All hybrid browser stability, 2-tab, cache, license & lookup checks passed.")
