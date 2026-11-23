@@ -100,4 +100,8 @@ finally:
 assert "tab0_done" in src_worker, "Tab 1 end-of-queue deadlock guard missing"
 assert "PROXY_HTTP_ERR" in src_login, "Fast proxy HTTP error wake missing"
 assert "browser_state" in src_main and "zero_evt" in src_main, "Periodic Chromium recycle gate missing"
+assert "timeout=8" in inspect.getsource(browser.send_tg), "send_tg urlopen timeout missing"
+assert "fail_count >= 6" in src_main, "Cascade restart threshold should be >= 6"
+assert "accountmtapi.mobilelegends.com" in inspect.getsource(browser._probe_proxy_ms), "API latency probe missing"
+assert "cutoff_ms" in inspect.getsource(browser.test_proxies), "Abnormal latency cutoff missing"
 print("All hybrid browser stability, 2-tab, cache, license & lookup checks passed.")
