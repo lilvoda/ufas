@@ -28,13 +28,17 @@ assert "ctx_opts['storage_state']" not in src_worker and "page2" in src_worker
 assert "page2 or page" not in src_worker, "Tab 1 must never alias Tab 0's page"
 assert "my_gen != ctx_gen" in src_worker, "Context switch must not burn account retries"
 assert "_startup_failed" in src_worker, "Startup failure must trigger restart loop when queue non-empty"
+assert "_browser_license_restart" in src_worker, "Browser/license error must trigger relaunch instead of burning err.txt"
 src_main = inspect.getsource(browser.async_main)
 assert "ensure_browser" in src_main and "is_connected()" in src_main, "Browser crash auto-relaunch missing"
+assert "_acquire_instance_lock" in src_main, "Single-instance lock missing"
 
 # 5. info.py + devices.txt lookup active
 assert browser.INFO_OK is True, f"info.py import failed: {browser.INFO_IMPORT_ERR}"
 dm = browser.DeviceManager("devices.txt")
-assert len(dm.devices) > 0
+assert len(dm.devices) >= 80, f"devices.txt should load all valid devices, got {len(dm.devices)}"
+import info as _info
+assert "game_version" in inspect.getsource(_info.GameConnection), "Dynamic game_version capture missing"
 
 # 6. Ephemeral CloakBrowser license activate/withdraw per run
 with tempfile.TemporaryDirectory() as tmpd:

@@ -697,9 +697,9 @@ def extract_player_data(result, role_info=None, creation_ts=0) -> Optional[Dict]
 # slots and a malformed short entry could produce empty imei_md5/android_id.
 # ---------------------------------------------------------------------------
 
-#: Minimum valid device-string length based on the actual devices.txt format:
-#: 4 (prefix) + 32 (MD5) + 16 (android_id) + 36 (UUID) = 88 characters.
-_DEVICE_MIN_LEN = 88
+#: Minimum valid device-string length (supports both 88-char and short `and_...` devices in devices.txt).
+_DEVICE_MIN_LEN = 5
+_SESSION_RESOLVER_DEVICE = "and_8f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0123456789abcdef01234567-0123-4567-89ab-cdef0123"
 
 
 class DeviceManager:
@@ -728,7 +728,7 @@ class DeviceManager:
                 for line in f:
                     line = line.strip()
                     if (
-                        line.startswith('and_')
+                        line.startswith(('and_', 'ios_'))
                         and len(line) >= _DEVICE_MIN_LEN
                         and line not in seen
                     ):
@@ -744,7 +744,6 @@ class DeviceManager:
             )
         if not devices:
             devices = [
-                "and_33c9084d10d104e2e0e95288782a92ff3h0ixfjcdk5dm3i9deffa6fb-7f6c-4b46-bcc3-a52ab97c367c",
                 "and_8f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0123456789abcdef01234567-0123-4567-89ab-cdef0123",
             ]
         return devices
@@ -883,7 +882,7 @@ class BaseConnection:
 
 class GameConnection(BaseConnection):
 
-    LOGIN_HOST = 'global-login.ml.youngjoygame.com'
+    LOGIN_HOST = 'login.ml.youngjoygame.com'
     LOGIN_PORT = 30021
 
     def __init__(self, device_id: str, device_model: Optional[str] = None,
@@ -900,7 +899,8 @@ class GameConnection(BaseConnection):
         self.advertising_id = device_info[48:] if len(device_info) > 48 else ""
 
         self.channel = 'and_usa'
-        self.client_version = '2.2.16.1232.1'
+        self.client_version = '2.1.95.1232.1'
+        self.game_version = self.client_version
         self.account_id = 0
         self.session_key = ''
         self.zone_id = 0
@@ -950,6 +950,7 @@ class GameConnection(BaseConnection):
                 host_port = res[1]
                 self.game_server_host, port_str = host_port.split(':')
                 self.game_server_port = int(port_str)
+                self.game_version = str(res.get(2) or self.client_version)
                 return True
         except Exception:
             pass
@@ -965,7 +966,7 @@ class GameConnection(BaseConnection):
 
                 auth = SdpStruct({
                     0: self.account_id, 1: self.session_key, 2: self.zone_id,
-                    4: self.client_version, 13: self.channel, 15: self.device_id,
+                    4: self.game_version, 13: self.channel, 15: self.device_id,
                 })
                 self.send_data(10001, auth)
                 self.send_data(10101, SdpStruct({0: 0, 2: 2}))
@@ -1015,7 +1016,7 @@ class GameConnection(BaseConnection):
                 timeout_count = 0
                 while timeout_count < 2:
                     cmd, res = self.recv_data()
-                    if cmd is None:
+                    if cmd is None or cmd == 20001:
                         break
                     if cmd == -1:
                         timeout_count += 1
@@ -1104,9 +1105,32 @@ def get_player_info(
     device_manager: DeviceManager,
     max_device_retries: int = 20,
 ) -> Optional[Dict]:
+    """2-stage lookup: (1) resolve (guid, session) -> (role_id, zone_id) via 88-char resolver,
+    (2) fetch full role_detail/role_info via real character devices in devices.txt."""
+    result = None
+    role_id, zone_id = None, None
+    resolver_devs = [d for d in device_manager.devices if len(d) >= 88] or [_SESSION_RESOLVER_DEVICE]
+    for rdev in resolver_devs[:3]:
+        rconn: Optional[GameConnection] = None
+        try:
+            rconn = GameConnection(device_id=rdev, device_manager=device_manager)
+            rconn.connect()
+            if not (rconn.login_to_login_server() and rconn.get_game_server() and rconn.connect_to_game_server()):
+                continue
+            result = rconn.get_account_info(guid, session, "and") or rconn.get_account_info(guid, session, "ios")
+            if result:
+                role_id, zone_id = rconn.get_highest_level_role(result)
+                break
+        except Exception:
+            pass
+        finally:
+            if rconn:
+                rconn.cleanup()
+
+    if not result or not role_id:
+        return None
 
     used_devices: List[str] = []
-
     for attempt in range(1, max_device_retries + 1):
         exclude = used_devices[-1] if used_devices else None
         device_id = device_manager.get_next_device(exclude)
@@ -1121,35 +1145,26 @@ def get_player_info(
             conn.connect()
 
             if not conn.login_to_login_server():
+                device_manager.mark_device_failure(device_id)
                 conn.cleanup()
                 continue
 
-            if not conn.get_game_server():
-                conn.cleanup()
-                continue
-
-            if not conn.connect_to_game_server():
-                conn.cleanup()
-                continue
-
-            result = conn.get_account_info(guid, session, "and")
-            if not result:
-                result = conn.get_account_info(guid, session, "ios")
-            if not result:
-                conn.cleanup()
-                continue
-
-            role_id, zone_id = conn.get_highest_level_role(result)
-            if not role_id:
+            if not conn.get_game_server() or not conn.connect_to_game_server():
                 conn.cleanup()
                 continue
 
             role_detail = conn.get_role_detail(role_id)
-            if not role_detail:
-                conn.cleanup()
-                continue
-
             role_info = conn.get_role_info(role_id, zone_id)
+            if not role_detail:
+                if not role_info:
+                    conn.cleanup()
+                    continue
+                role_detail = {0: [{
+                    0: role_id, 1: zone_id,
+                    2: role_info.get(2, 'Unknown'), 3: role_info.get(3, 0),
+                    8: role_info.get(6), 95: role_info.get(15),
+                    83: role_info.get(10, 0),
+                }]}
 
             player_data = extract_player_data(role_detail, role_info, conn.creation_ts)
             if not player_data:
