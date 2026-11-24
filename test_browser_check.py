@@ -226,6 +226,8 @@ async def _run_behavioral_checks():
             browser.run_worker,
             browser.withdraw_cloak_license,
             browser.activate_cloak_license,
+            browser._acquire_instance_lock,
+            browser._release_instance_lock,
             list(_sys_t.argv),
             browser._TUI_ACTIVE,
         )
@@ -261,6 +263,8 @@ async def _run_behavioral_checks():
             browser.run_worker = _fake_worker
             browser.activate_cloak_license = lambda k="": "cb_testkey"
             browser.withdraw_cloak_license = lambda: withdraws.append("withdrawn")
+            browser._acquire_instance_lock = lambda: None
+            browser._release_instance_lock = lambda fh: None
             browser._LICENSE_SESSION_ACTIVE = True
             for k_s in ('valid', 'invalid', 'otp', 'error', 'waf', 'checked', 'proxy_ctx', 'bytes_used'):
                 browser.stats[k_s] = 0
@@ -277,6 +281,8 @@ async def _run_behavioral_checks():
                 browser.run_worker,
                 browser.withdraw_cloak_license,
                 browser.activate_cloak_license,
+                browser._acquire_instance_lock,
+                browser._release_instance_lock,
                 _sys_t.argv,
                 browser._TUI_ACTIVE,
             ) = orig_vals
@@ -304,5 +310,34 @@ assert _det.maybe_alert(now_t=47.0) is None and not _det.was_drop, "Detector mus
 _det.resume(now_t=62.0)
 assert not _det.evaluate(now_t=63.0)[0], "Wave/recycle pause resume() must prevent false idle drop alarm"
 assert "PROXY" in _det.summary(), f"Summary missing dominant bottleneck: {_det.summary()}"
+
+# 11. Bandwidth optimization guards (_ROUTE_RE domain blocks & disk static cache round-trip)
+for _blk_u in (
+    "https://www.google.com/complete/search",
+    "https://content-autofill.googleapis.com/v1/pages/abc",
+    "https://158.177.38.248/",
+    "https://errors.aliyun.com/images/test",
+):
+    assert browser._ROUTE_RE.search(_blk_u), f"Expected blocked route match for {_blk_u}"
+for _ok_u in (
+    "https://accountmtapi.mobilelegends.com/",
+    "https://cloudauth-device-dualstack.ap-southeast-1.aliyuncs.com/device",
+    "https://91b88bfa1d2370355377a8568184628c.captcha-open-southeast.aliyuncs.com/init",
+):
+    assert not browser._ROUTE_RE.search(_ok_u), f"Must not intercept API route {_ok_u}"
+
+with tempfile.TemporaryDirectory() as _cd:
+    _cf = os.path.join(_cd, "cache.bin")
+    _saved_cache = dict(browser._STATIC_CACHE)
+    browser._STATIC_CACHE.clear()
+    try:
+        browser._STATIC_CACHE["https://o.alicdn.com/test.js"] = (200, {"content-type": "application/javascript"}, b"console.log(1);")
+        browser._save_static_cache(_cf)
+        browser._STATIC_CACHE.clear()
+        assert browser._load_static_cache(_cf) == 1
+        assert browser._STATIC_CACHE["https://o.alicdn.com/test.js"][2] == b"console.log(1);"
+    finally:
+        browser._STATIC_CACHE.clear()
+        browser._STATIC_CACHE.update(_saved_cache)
 
 print("All hybrid browser stability, 2-tab, cache, license & lookup checks passed.")

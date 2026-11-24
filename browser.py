@@ -1625,6 +1625,14 @@ async def _solve_waf_impl(page, ctx) -> bool:
 # ── Smart Browser Launcher (CloakBrowser Pro with Playwright Chrome fallback) ─
 async def launch_browser_smart(headless=True, humanize=False):
     global _driver_pid, _pw_instance
+    _bg_kill_args = [
+        '--disable-background-networking',
+        '--disable-sync',
+        '--disable-component-update',
+        '--disable-domain-reliability',
+        '--disable-breakpad',
+        '--no-pings',
+    ]
     c_args = [
         '--disable-blink-features=AutomationControlled',
         '--no-first-run',
@@ -1632,13 +1640,14 @@ async def launch_browser_smart(headless=True, humanize=False):
         '--disable-dev-shm-usage',
         '--no-sandbox',
         '--mute-audio',
+        *_bg_kill_args,
     ]
     for _try in range(3):
         try:
             lic_key = _ACTIVE_LICENSE_KEY or activate_cloak_license()
-            # ponytail: keep CloakBrowser Pro native stealth intact while avoiding Playwright mouse-hook jitter on multi-worker touch drag
+            # ponytail: keep CloakBrowser Pro native stealth intact while blocking Google background telemetry
             b = await asyncio.wait_for(
-                launch_async(headless=headless, humanize=humanize, license_key=lic_key or None),
+                launch_async(headless=headless, humanize=humanize, args=_bg_kill_args, license_key=lic_key or None),
                 timeout=25.0,
             )
             if not _TUI_ACTIVE: p_out(f"{c(GREEN)}[*] CloakBrowser Pro siap ✓{W}")
@@ -2070,8 +2079,50 @@ async def do_login_via_browser(page, ctx, user: str, passw: str, wid: int = 0, w
 
 _STATIC_CACHE = {}  # url -> (status, headers, body_bytes)
 _CACHE_LOCKS: dict[str, asyncio.Lock] = {}
+_CACHE_DIRTY = 0
 _PROXY_FAILS: dict[tuple[str, str], int] = {}
 _RUN_SALT = f"{os.getpid() % 0xfff:x}{int(time.time()) % 0xffff:x}"
+
+def _load_static_cache(path: str = '') -> int:
+    fp = path or CACHE_STATE_FILE
+    try:
+        st = os.stat(fp)
+        if time.time() - st.st_mtime > 86400:
+            try:
+                os.unlink(fp)
+            except Exception:
+                pass
+            return 0
+        with open(fp, 'rb') as f:
+            raw = f.read()
+        data = json.loads(zlib.decompress(raw).decode('utf-8')) if raw[:1] != b'{' else json.loads(raw.decode('utf-8'))
+        loaded = 0
+        for u, item in list(data.items())[:128]:
+            if isinstance(item, list) and len(item) == 3:
+                _STATIC_CACHE[u] = (int(item[0]), dict(item[1]), base64.b64decode(item[2]))
+                loaded += 1
+        return loaded
+    except Exception:
+        return 0
+
+def _save_static_cache(path: str = '') -> None:
+    global _CACHE_DIRTY
+    if not _STATIC_CACHE:
+        return
+    fp = path or CACHE_STATE_FILE
+    try:
+        payload = {
+            u: [st, hdrs, base64.b64encode(body).decode('ascii')]
+            for u, (st, hdrs, body) in list(_STATIC_CACHE.items())[:128]
+        }
+        blob = zlib.compress(json.dumps(payload, separators=(',', ':')).encode('utf-8'), 6)
+        tmp = f"{fp}.{os.getpid()}.tmp"
+        with open(tmp, 'wb') as f:
+            f.write(blob)
+        os.replace(tmp, fp)
+        _CACHE_DIRTY = 0
+    except Exception:
+        pass
 
 _BLOCKED_DOMAINS = (
     'api.moba5v5.com/r',
@@ -2079,11 +2130,22 @@ _BLOCKED_DOMAINS = (
     'google-analytics',
     'facebook',
     'doubleclick',
+    'www.google.com',
+    'accounts.google.com',
+    'clients2.google.com',
+    'googleapis.com',
+    'gstatic.com',
+    'gvt1.com',
+    'gvt2.com',
+    'errors.aliyun.com',
+    '158.177.38.248',
 )
 
 _ROUTE_RE = re.compile(
     r'(\.(png|jpe?g|gif|webp|svg|woff2?|ttf|eot|ico|mp4|mp3|js|css)(\?|$)'
-    r'|api\.moba5v5\.com/r|sg-api\.mobilelegends\.com|google-analytics|facebook|doubleclick)',
+    r'|api\.moba5v5\.com/r|sg-api\.mobilelegends\.com|google-analytics|facebook|doubleclick'
+    r'|www\.google\.com|accounts\.google\.com|clients2\.google\.com|googleapis\.com|gstatic\.com'
+    r'|gvt[12]\.com|errors\.aliyun\.com|158\.177\.38\.248)',
     re.I,
 )
 
@@ -2153,6 +2215,10 @@ async def _route_filter(route):
                         if len(_STATIC_CACHE) >= 128:
                             _STATIC_CACHE.pop(next(iter(_STATIC_CACHE)), None)
                         _STATIC_CACHE[url] = (resp.status, clean_hdrs, body)
+                        global _CACHE_DIRTY
+                        _CACHE_DIRTY += 1
+                        if _CACHE_DIRTY >= 4:
+                            _save_static_cache()
                     if resp.status >= 400:
                         return await route.abort()
                     return await route.fulfill(status=resp.status, headers=clean_hdrs, body=body)
@@ -2542,7 +2608,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
     inflight_tabs = 0
     recovering = False
     tab0_done = False
-    ACCOUNTS_PER_CTX = 40  # ponytail: rotate IP+cookies before Aliyun WAF escalation slows checks; RAM JS cache keeps reload cheap
+    ACCOUNTS_PER_CTX = 120  # ponytail: reuse solved session longer to cut ~230KB/ctx cloudauth+captcha cost; raise/lower if WAF rate shifts
 
     async def _recover_ctx(local_gen: int, reason: str):
         nonlocal ctx_gen, ctx_accts, slider_cleared, recovering, page2
@@ -3085,6 +3151,7 @@ async def async_main():
             return browser_ref[0]
 
     try:
+        _load_static_cache()
         browser_ref[0] = await launch_browser_smart(headless=HEADLESS, humanize=False)
         browser_state['last_relaunch'] = time.monotonic()
 
@@ -3230,6 +3297,8 @@ async def async_main():
             # Tunggu sebentar agar semua worker bisa cleanup dengan benar
             await asyncio.gather(*tasks, return_exceptions=True)
     finally:
+        if _CACHE_DIRTY:
+            _save_static_cache()
         if _TUI_ACTIVE:
             stats['status'] = 'DONE'
             render_dashboard(force=True)

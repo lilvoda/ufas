@@ -7,6 +7,7 @@ combo_seen.db*
 _test_*/
 .chromium_cache/
 .http_cache/
+.browser_cache_state.json*
 graphify-out/
 *.log
 backup_cloak/
