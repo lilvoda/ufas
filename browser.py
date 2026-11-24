@@ -1256,7 +1256,9 @@ async def test_proxies(raw_proxies, browser=None, concurrency=16):
                         fast_ccs.append(cc)
         if len(fast_ccs) >= 12:
             break
-    if len(fast_ccs) >= 1:
+    if len(fast_ccs) >= 4:
+        DATAIMPULSE_REGIONS[:] = fast_ccs
+    elif len(fast_ccs) >= 1:
         merged_ccs = fast_ccs + [r for r in DATAIMPULSE_REGIONS if r not in fast_ccs and r not in _TUNNEL_BLACKLIST]
         DATAIMPULSE_REGIONS[:] = merged_ccs
 
@@ -2055,21 +2057,19 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                 browser_state['recycling'] = True
                 browser_state['gate'].clear()
                 try:
-                    await asyncio.wait_for(browser_state['zero_evt'].wait(), timeout=20.0)
+                    await asyncio.wait_for(browser_state['zero_evt'].wait(), timeout=8.0)
                 except Exception:
                     pass
-                did_recycle = False
                 try:
                     if browser_state['active'] == 0:
                         dbg("Periodic Chromium recycle (clean memory/speed reset)...")
                         ref_b = await ensure_browser()
                         new_b = await ensure_browser(force_relaunch=True, stale_browser=ref_b)
                         cur_browser = new_b
-                        did_recycle = (new_b is not ref_b)
                 except Exception:
                     pass
                 finally:
-                    browser_state['born_ctx'] = stats['proxy_ctx'] if did_recycle else (stats['proxy_ctx'] - 150)
+                    browser_state['born_ctx'] = stats['proxy_ctx']
                     browser_state['recycling'] = False
                     browser_state['gate'].set()
 
@@ -2846,10 +2846,11 @@ async def async_main():
             p_out(f"{c(CYAN)}[*] Menguji ping proxy ke API Moonton ({len(raw_p)} proxy)...{W}")
             good_proxies = await test_proxies(raw_p, concurrency=16)
             if good_proxies:
-                p_out(f"{c(GREEN)}[*] {len(good_proxies)} proxy berfungsi ✓{W}")
-                live_pool = [p[1] for p in good_proxies]
+                fast_cap = good_proxies[:max(24, NUM_CONTEXTS * 3)]
+                p_out(f"{c(GREEN)}[*] {len(good_proxies)} proxy berfungsi, pakai {len(fast_cap)} tercepat ✓{W}")
+                live_pool = [p[1] for p in fast_cap]
                 for i in range(NUM_CONTEXTS):
-                    proxy_assignments[i] = good_proxies[i % len(good_proxies)][1]
+                    proxy_assignments[i] = fast_cap[i % len(fast_cap)][1]
             else:
                 p_out(f"\n  {c(RED)}{BD}[!] Semua proxy gagal diuji.{W}")
                 p_out(f"  {c(GOLD)}Penyebab: Kuota DataImpulse habis (407 TRAFFIC_EXHAUSTED) atau proxy offline.{W}")
