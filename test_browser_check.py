@@ -279,4 +279,26 @@ async def _run_behavioral_checks():
             browser._LICENSE_SESSION_ACTIVE = False
 
 _asyncio.run(_run_behavioral_checks())
+
+# 10. Smart speed-drop detector: warmup guard, attribution, cooldown & recovery
+_det = browser._SpeedDetector(window_s=30.0)
+_det.reset(now_t=0.0)
+browser.stats['workers'] = 2
+assert not _det.evaluate(now_t=5.0)[0], "Must not false-alarm during warmup"
+for i in range(12):
+    _det.mark_check(now_t=1.0 + i * 1.0)
+assert not _det.evaluate(now_t=13.0)[0], "Steady baseline must not trigger drop"
+_det.record_stall('proxy', 12.0, now_t=32.0)
+_det.record_stall('waf', 3.0, now_t=33.0)
+_is_d, _tag, _desc, _pct, _cr, _pr = _det.evaluate(now_t=34.0)
+assert _is_d and _tag == 'PROXY' and _pct == 80, f"Expected PROXY 80% drop, got {(_is_d, _tag, _pct)}"
+assert _det.maybe_alert(now_t=34.0) is not None, "First drop transition must emit alert"
+assert _det.maybe_alert(now_t=40.0) is None, "Cooldown must suppress repeat alert within 25s"
+for j in range(12):
+    _det.mark_check(now_t=41.0 + j * 0.5)
+assert _det.maybe_alert(now_t=47.0) is None and not _det.was_drop, "Detector must clear after rate recovers"
+_det.resume(now_t=62.0)
+assert not _det.evaluate(now_t=63.0)[0], "Wave/recycle pause resume() must prevent false idle drop alarm"
+assert "PROXY" in _det.summary(), f"Summary missing dominant bottleneck: {_det.summary()}"
+
 print("All hybrid browser stability, 2-tab, cache, license & lookup checks passed.")

