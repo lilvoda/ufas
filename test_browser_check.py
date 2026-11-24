@@ -38,6 +38,7 @@ assert browser.INFO_OK is True, f"info.py import failed: {browser.INFO_IMPORT_ER
 dm = browser.DeviceManager(os.path.join(os.path.dirname(os.path.abspath(__file__)), "devices.txt"))
 assert len(dm.devices) >= 80, f"devices.txt should load all valid devices, got {len(dm.devices)}"
 import info as _info
+import full_info as _full_info
 assert "game_version" in inspect.getsource(_info.GameConnection), "Dynamic game_version capture missing"
 
 # 6. Ephemeral CloakBrowser license activate/withdraw per run
@@ -83,7 +84,10 @@ assert "if not raw_p:" in src_main, "Missing empty proxy file abort guard"
 assert "not body.startswith(\"{\")" in inspect.getsource(browser.do_fast_http_post)
 assert "extract_player_data(role_detail, role_info, 0)" in inspect.getsource(_info.get_player_info)
 assert "size < 4" in inspect.getsource(_info.BaseConnection.recv_data)
-_ep = _info.extract_player_data({0: [{0: 1, 1: 1, 2: "X", 3: 10, 83: 5, 50: 9999999999}]}, {24: "motto_not_int", 22: 200, 77: 100}, 0)
+_ep_lean = _info.extract_player_data({0: [{0: 12345, 1: 2020, 2: "X", 3: 10, 8: 112, 95: 140, 83: 45}]})
+assert _ep_lean and _ep_lean["data"]["basic_info"]["player_id"] == 12345 and _ep_lean["data"]["basic_info"]["skin_count"] == 45
+assert _ep_lean["data"]["game_info"]["current_rank"] == "Legend V" and "extra_info" not in _ep_lean["data"], "info.py must stay lean (ID, skin, rank only)"
+_ep = _full_info.extract_player_data({0: [{0: 1, 1: 1, 2: "X", 3: 10, 83: 5, 50: 9999999999}]}, {24: "motto_not_int", 22: 200, 77: 100}, 0)
 assert _ep and _ep["data"]["extra_info"]["likes"] == 0
 assert _ep["data"]["extra_info"]["win_rate"] == "N/A"
 assert _ep["data"]["extra_info"]["starlight_user"] == "No"

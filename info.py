@@ -1,44 +1,16 @@
 import time
 import random
-import datetime
 import socket
 import struct
 import zlib
 import threading
 import re
-import json
-import os
 
 import zstandard as zstd
 from Crypto.Cipher import AES
 from enum import Enum
 from typing import Any, Tuple, Optional, Dict, List
 from collections import defaultdict
-
-HERO_ID_MAP = {
-    1: "Miya", 2: "Balmond", 3: "Saber", 4: "Alice", 5: "Nana", 6: "Tigreal",
-    7: "Alucard", 8: "Karina", 9: "Akai", 10: "Franco", 11: "Bane", 12: "Bruno",
-    13: "Clint", 14: "Rafaela", 15: "Eudora", 16: "Zilong", 17: "Fanny", 18: "Layla",
-    19: "Minotaur", 20: "Lolita", 21: "Hayabusa", 22: "Freya", 23: "Gord", 24: "Natalia",
-    25: "Kagura", 26: "Chou", 27: "Sun", 28: "Alpha", 29: "Ruby", 30: "Yi Sun-shin",
-    31: "Moskov", 32: "Johnson", 33: "Cyclops", 34: "Estes", 35: "Hilda", 36: "Aurora",
-    37: "Lapu-Lapu", 38: "Vexana", 39: "Roger", 40: "Karrie", 41: "Gatotkaca", 42: "Harley",
-    43: "Irithel", 44: "Grock", 45: "Argus", 46: "Odette", 47: "Lancelot", 48: "Diggie",
-    49: "Hylos", 50: "Zhask", 51: "Helcurt", 52: "Pharsa", 53: "Lesley", 54: "Jawhead",
-    55: "Angela", 56: "Gusion", 57: "Valir", 58: "Martis", 59: "Uranus", 60: "Hanabi",
-    61: "Chang'e", 62: "Kaja", 63: "Selena", 64: "Aldous", 65: "Claude", 66: "Vale",
-    67: "Leomord", 68: "Lunox", 69: "Hanzo", 70: "Belerick", 71: "Kimmy", 72: "Thamuz",
-    73: "Harith", 74: "Minsitthar", 75: "Kadita", 76: "Faramis", 77: "Badang", 78: "Khufra",
-    79: "Granger", 80: "Guinevere", 81: "Esmeralda", 82: "Terizla", 83: "X.Borg", 84: "Ling",
-    85: "Dyrroth", 86: "Lylia", 87: "Baxia", 88: "Masha", 89: "Wanwan", 90: "Silvanna",
-    91: "Cecilion", 92: "Carmilla", 93: "Atlas", 94: "Popol and Kupa", 95: "Yu Zhong",
-    96: "Luo Yi", 97: "Benedetta", 98: "Khaleed", 99: "Barats", 100: "Brody", 101: "Yve",
-    102: "Mathilda", 103: "Paquito", 104: "Gloo", 105: "Beatrix", 106: "Phoveus",
-    107: "Natan", 108: "Aulus", 109: "Aamon", 110: "Valentina", 111: "Edith", 112: "Floryn",
-    113: "Yin", 114: "Melissa", 115: "Xavier", 116: "Julian", 117: "Fredrinn", 118: "Joy",
-    119: "Novaria", 120: "Arlott", 121: "Ixia", 122: "Nolan", 123: "Cici", 124: "Chip",
-    125: "Zhuxin", 126: "Suyou", 127: "Lukas", 128: "Kalea", 129: "Zetian", 130: "Obsidia"
-}
 
 DEVICE_MODELS = [
     'Xiaomi:23049PCD8G', 'Xiaomi:2201123G', 'Xiaomi:22011211C', 'Xiaomi:2211133C',
@@ -58,33 +30,6 @@ DEVICE_MODELS = [
 
 AES_KEY = bytes.fromhex('f5a193d50ade553e9835595f5cd75ddd')
 AES_IV = b'\x00' * 16
-
-SKIN_TIER_LABELS = {
-    'common': 'Common',
-    'exceptional': 'Exceptional',
-    'deluxe': 'Deluxe',
-    'exquisite': 'Exquisite',
-    'grand': 'Grand',
-    'supreme': 'Supreme',
-    'unknown': 'Unknown',
-}
-
-_SKIN_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'skin_db.json')
-try:
-    with open(_SKIN_DB_PATH, 'r', encoding='utf-8') as _f:
-        _raw = _f.read().strip()
-        if not _raw.startswith('{'):
-            _raw = '{' + _raw
-        SKIN_DB = json.loads(_raw)
-except Exception:
-    SKIN_DB = {}
-
-
-def get_skin_tier(skin_id):
-    tier = SKIN_DB.get(str(skin_id))
-    if not tier:
-        return None
-    return SKIN_TIER_LABELS.get(tier, tier.capitalize())
 
 
 class SdpDataType(Enum):
@@ -299,79 +244,6 @@ class SdpStruct(dict):
         self._pack_to_binary()
 
 
-def get_hero_history(tag_91: list) -> List[str]:
-    hero_list = [HERO_ID_MAP.get(hid, f"Unknown({hid})") for hid in reversed(tag_91)]
-    return hero_list[:5]
-
-
-def map_collector_point(point: int) -> str:
-    if point < 1000:
-        return "No Tier"
-    tiers = [
-        (1000, 4000, "Amateur Collector"),
-        (4000, 10000, "Junior Collector"),
-        (10000, 22000, "Seasoned Collector"),
-        (22000, 44000, "Expert Collector"),
-        (44000, 84000, "Renowned Collector"),
-        (84000, 160000, "Exalted Collector"),
-        (160000, 280000, "Mega Collector"),
-        (280000, float('inf'), "World Collector"),
-    ]
-    for min_p, max_p, name in tiers:
-        if min_p <= point < max_p:
-            if name == "World Collector":
-                return "World Collector"
-            per_level = (max_p - min_p) / 5
-            level = int((point - min_p) // per_level)
-            roman = ["V", "IV", "III", "II", "I"][level]
-            return f"{name} {roman}"
-    return "Unknown"
-
-
-def parse_skin_counts(tag_118) -> dict:
-    if not tag_118 or not isinstance(tag_118, dict):
-        return {}
-
-    skin_data = None
-    for k in (4, '4'):
-        v = tag_118.get(k)
-        if isinstance(v, dict) and v:
-            skin_data = v
-            break
-
-    if skin_data is None:
-        skin_data = tag_118
-
-    if not isinstance(skin_data, dict):
-        return {}
-
-    skin_types = {
-        6: "Supreme Skins",
-        5: "Grand Skins",
-        4: "Exquisite Skins",
-        3: "Deluxe Skins",
-        2: "Exceptional Skins",
-        1: "Common Skins"
-    }
-
-    skin_counts = {}
-    total_skins = 0
-
-    for skin_id, count in skin_data.items():
-        try:
-            skin_id_int = int(skin_id)
-        except (ValueError, TypeError):
-            continue
-        if skin_id_int in skin_types:
-            skin_counts[skin_types[skin_id_int]] = count
-            total_skins += count
-
-    if total_skins > 0:
-        skin_counts["Total Skins"] = total_skins
-
-    return skin_counts
-
-
 _RANK_DEFINITIONS = [
     (0, 3, "Warrior III"), (4, 7, "Warrior II"), (8, 11, "Warrior I"),
     (12, 16, "Elite III"), (17, 21, "Elite II"), (22, 26, "Elite I"),
@@ -400,321 +272,32 @@ def map_rank(p: int) -> str:
     return "Unknown"
 
 
-def format_timestamp(timestamp: int) -> str:
-    try:
-        if timestamp == 0:
-            return "Never"
-        return datetime.datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return "Unknown"
-
-
-def format_timestamp_full(timestamp: int) -> str:
-    try:
-        if timestamp == 0:
-            return "N/A"
-        utc_dt = datetime.datetime.fromtimestamp(timestamp, datetime.timezone.utc)
-        pht_dt = utc_dt + datetime.timedelta(hours=8)
-        return pht_dt.strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return "Invalid timestamp"
-
-
 def extract_player_data(result, role_info=None, creation_ts=0) -> Optional[Dict]:
+    """Lean extractor: Game ID (player_id, server), skin count, and rank (plus level/nickname)."""
     if not isinstance(result, dict) or not result.get(0) or len(result[0]) == 0:
         return None
     try:
         player = result[0][0]
-
-        nickname = player.get(2, "Unknown")
-        player_id = player.get(0, "Unknown")
-        server = player.get(1, "Unknown")
-        level = player.get(3, "Unknown")
-        skin = player.get(83, "Unknown")
-        hero_count = role_info.get(9, 0) if role_info else 0
-        matches = role_info.get(22, 0) if role_info else 0
-
-        location = "NOT FOUND"
-        loc_data = player.get(71)
-        if loc_data and isinstance(loc_data, list) and len(loc_data) >= 2:
-            location = ", ".join(str(x) for x in loc_data)
-
-        last_login = player.get(5, 0)
-        last_login_country = player.get(87, "Unknown")
-        create_account_country = player.get(97, "Unknown")
-
-        squad_icon = player.get(31, "")
-        squad_name = str(player.get(30, "") or "").replace("`", "").strip()
-        squad = f"{squad_icon} {squad_name}".strip() if squad_name else "—"
-
-        squad_id = 0
-        if role_info and isinstance(role_info, dict):
-            squad_id = role_info.get(34, 0)
-        if not squad_id:
-            squad_id = player.get(34, player.get(28, 0))
-
-        tag_95 = player.get(95)
-        tag_8 = player.get(8)
-        high_rank = map_rank(tag_95) if tag_95 is not None else "Unknown"
-        current_rank = map_rank(tag_8) if tag_8 is not None else "Unknown"
-        achievement_points = player.get(7, 0)
-
-        tag_136 = player.get(136, {})
-        collector_point = tag_136.get(9, 0) if isinstance(tag_136, dict) else 0
-        collector_rank = tag_136.get(10, 0) if isinstance(tag_136, dict) else 0
-        collector_tier = map_collector_point(collector_point)
-
-        tag_91 = player.get(91, [])
-        hero_history = get_hero_history(tag_91) if tag_91 else ["Private / Not Available"]
-
-        skin_counts = {}
-        if role_info and isinstance(role_info, dict):
-            tag_118 = role_info.get(118, {})
-            if isinstance(tag_118, dict):
-                skin_counts = parse_skin_counts(tag_118)
-
-        rating_score = player.get(9, 0)
-
-        followers = 0
-        if role_info and isinstance(role_info, dict):
-            followers = role_info.get(23, 0)
-        if not followers:
-            followers = player.get(15, 0)
-
-        popularity = player.get(14, 0)
-
-        likes = 0
-        if role_info and isinstance(role_info, dict):
-            _v24 = role_info.get(24, 0)
-            if isinstance(_v24, int):
-                likes = _v24
-        if not likes:
-            _v61 = player.get(61, 0)
-            likes = _v61 if isinstance(_v61, int) else 0
-
-        _t111 = player.get(111, {})
-        if isinstance(_t111, dict):
-            _cs_current = _t111.get(0, 0)
-            credits_score = f"{_cs_current}/110" if _cs_current else "N/A"
-        else:
-            _cs_int = int(_t111) if _t111 else 0
-            credits_score = f"{_cs_int}/110" if _cs_int else "N/A"
-
-        restriction_flags = "None"
-        _flags_val = 0
-        if role_info and isinstance(role_info, dict):
-            _flags_val = role_info.get(102, 0)
-        if not _flags_val:
-            _t135 = player.get(135, {})
-            if isinstance(_t135, dict):
-                _flags_val = _t135.get(0, 0)
-        if _flags_val:
-            _set_bits = bin(int(_flags_val)).count('1')
-            _total_bits = 7
-            _pct = round((_set_bits / _total_bits) * 100, 1)
-            if _pct < 30:
-                _risk, _risk_icon = "Low Risk", "✅"
-            elif _pct < 60:
-                _risk, _risk_icon = "Medium Risk", "⚠️"
-            else:
-                _risk, _risk_icon = "High Risk", "🚨"
-            restriction_flags = f"{_pct}% {_risk_icon} ({_risk})"
-
-        _t135 = player.get(135, {})
-        _aff_level = _t135.get(1, 0) if isinstance(_t135, dict) else 0
-        _AFFINITY_MAP = {0: "None", 1: "Bronze", 2: "Silver", 3: "Gold", 4: "Platinum", 5: "Diamond"}
-        affinity_label = _AFFINITY_MAP.get(_aff_level, f"Level {_aff_level}") if _aff_level else "None"
-
-        import time as _time
-        _now_ts = _time.time()
-        _sl_expiry = player.get(50, 0)
-        if _sl_expiry and isinstance(_sl_expiry, int) and _now_ts < _sl_expiry < _now_ts + 400 * 86400:
-            starlight_user = "Yes ⭐"
-        else:
-            starlight_user = "No"
-
-        _MIN_VALID_TS = 1451577600
-        _create_ts_fallback = player.get(6, 0)
-        if creation_ts and creation_ts >= _MIN_VALID_TS:
-            creation_date = format_timestamp_full(creation_ts)
-        elif _create_ts_fallback and _create_ts_fallback >= _MIN_VALID_TS:
-            creation_date = format_timestamp_full(_create_ts_fallback)
-        else:
-            creation_date = "N/A"
-
-        _tag45 = player.get(45, {})
-        if isinstance(_tag45, dict) and _tag45:
-            _hero_entries = []
-            for _entry in _tag45.values():
-                if isinstance(_entry, dict):
-                    _hid = _entry.get(0, 0)
-                    _hts = _entry.get(1, 0)
-                    _hname = HERO_ID_MAP.get(_hid, f"Unknown({_hid})")
-                    _hero_entries.append((_hts, _hname))
-            _hero_entries.sort(key=lambda x: x[0], reverse=True)
-            last_heroes_purchase = ", ".join(h for _, h in _hero_entries) if _hero_entries else "N/A"
-        else:
-            _hero_buy_ts = player.get(175, 0)
-            last_heroes_purchase = format_timestamp(_hero_buy_ts) if _hero_buy_ts else "N/A"
-
-        mcl_wins = 0
-        if role_info and isinstance(role_info, dict):
-            mcl_wins = role_info.get(46, 0)
-        if not mcl_wins:
-            mcl_wins = player.get(104, player.get(103, 0))
-
-        win_count = 0
-        if role_info and isinstance(role_info, dict):
-            win_count = role_info.get(22, 0)
-
-        total_battles = 0
-        if role_info and isinstance(role_info, dict):
-            total_battles = role_info.get(77, 0)
-        if not total_battles:
-            total_battles = player.get(17, 0)
-
-        if isinstance(total_battles, int) and isinstance(win_count, int) and total_battles > 0 and 0 <= win_count <= total_battles:
-            win_rate = f"{(win_count / total_battles * 100):.1f}%"
-        else:
-            win_rate = "N/A"
-
-        bp = 0
-        if role_info and isinstance(role_info, dict):
-            _bp_raw = role_info.get(111, 0)
-            if isinstance(_bp_raw, int):
-                bp = _bp_raw
-            elif isinstance(_bp_raw, dict):
-                bp = _bp_raw.get(0, 0)
-
-        squad_motto = "N/A"
-        if role_info and isinstance(role_info, dict):
-            _motto = role_info.get(24, "")
-            if _motto and isinstance(_motto, str):
-                squad_motto = _motto
-
-        diamonds = 0
-        if role_info and isinstance(role_info, dict):
-            diamonds = role_info.get(46, 0)
-
-        starlight_count = 0
-        if role_info and isinstance(role_info, dict):
-            starlight_count = role_info.get(60, 0)
-
-        skin_history = []
-        if role_info and isinstance(role_info, dict):
-            _tag92 = role_info.get(92, [])
-            if isinstance(_tag92, list):
-                for _entry in _tag92[:10]:
-                    if isinstance(_entry, dict):
-                        _sid = _entry.get(0, 0)
-                        _tier = _entry.get(2, 0)
-                        _ts = _entry.get(4, 0)
-                        _tier_name = {1: "Common", 2: "Exceptional", 3: "Deluxe",
-                                      4: "Exquisite", 5: "Grand", 6: "Supreme"}.get(_tier, f"T{_tier}")
-                        _date = format_timestamp(_ts) if _ts else "?"
-                        skin_history.append(f"SkinID:{_sid}({_tier_name})|{_date}")
-        skin_history_str = ", ".join(skin_history) if skin_history else "N/A"
-
-        _EMBLEM_MAP = {1: "Fighter", 2: "Assassin", 3: "Mage", 4: "Marksman",
-                       5: "Support", 6: "Tank", 7: "Common"}
-        emblem_levels = "N/A"
-        if role_info and isinstance(role_info, dict):
-            _tag101 = role_info.get(101, {})
-            if isinstance(_tag101, dict) and _tag101:
-                _parts = []
-                for _eid in sorted(_tag101.keys()):
-                    _ename = _EMBLEM_MAP.get(_eid, f"E{_eid}")
-                    _parts.append(f"{_ename}:Lv{_tag101[_eid]}")
-                emblem_levels = ", ".join(_parts) if _parts else "N/A"
-
-        _skin_ts = player.get(176, 0)
-        latest_skin_date = format_timestamp(_skin_ts) if _skin_ts else "N/A"
-
-        _latest_skin_id = player.get(175, 0)
-        latest_skin_id_str = str(_latest_skin_id) if _latest_skin_id else "N/A"
-        latest_skin_tier = get_skin_tier(_latest_skin_id) if _latest_skin_id else "N/A"
-
-        bindings = "N/A"
-        _bindings = player.get(47, {})
-        if isinstance(_bindings, dict) and _bindings:
-            binding_types = {
-                0: "Facebook", 1: "Google", 2: "VK", 3: "Twitter",
-                4: "Game Center", 5: "Moonton", 6: "Email", 7: "Phone"
-            }
-            binding_list = []
-            for btype, bval in _bindings.items():
-                try:
-                    btype_int = int(btype)
-                    bname = binding_types.get(btype_int, f"Type{btype_int}")
-                    binding_list.append(bname)
-                except Exception:
-                    pass
-            bindings = ", ".join(binding_list) if binding_list else "N/A"
-
+        ri = role_info if isinstance(role_info, dict) else {}
+        tag_8 = player.get(8) if player.get(8) is not None else ri.get(6)
+        tag_95 = player.get(95) if player.get(95) is not None else ri.get(15)
+        skin = player.get(83)
+        if skin is None:
+            skin = ri.get(10, 0)
         return {
             'status': 'success',
             'data': {
                 'basic_info': {
-                    'nickname': nickname,
-                    'player_id': player_id,
-                    'server': server,
-                    'level': level,
+                    'nickname': player.get(2, 'Unknown'),
+                    'player_id': player.get(0, 'Unknown'),
+                    'server': player.get(1, 'Unknown'),
+                    'level': player.get(3, ri.get(3, 0)),
                     'skin_count': skin,
-                    'hero_count': hero_count,
-                },
-                'skin_info': {
-                    'skin_breakdown': skin_counts,
-                },
-                'location_info': {
-                    'location': location,
-                    'last_login': format_timestamp(last_login),
-                    'last_login_country': last_login_country,
-                    'create_account_country': create_account_country,
                 },
                 'game_info': {
-                    'current_rank': current_rank,
-                    'high_rank': high_rank,
-                    'achievement_points': achievement_points,
-                    'squad': squad,
-                    'squad_id': squad_id,
-                    'hero_history': hero_history,
-                    'matches': matches,
+                    'current_rank': map_rank(tag_8) if isinstance(tag_8, int) else 'Unknown',
+                    'high_rank': map_rank(tag_95) if isinstance(tag_95, int) else 'Unknown',
                 },
-                'collector_info': {
-                    'collector_point': collector_point,
-                    'collector_tier': collector_tier,
-                    'collector_rank': collector_rank,
-                },
-                'security_info': {
-                    'v2l_status': 'No',
-                    'bindings': bindings,
-                },
-                'extra_info': {
-                    'rating_score': rating_score,
-                    'followers': followers,
-                    'popularity': popularity,
-                    'likes': likes,
-                    'credits_score': credits_score if credits_score != "N/A" else None,
-                    'restriction_flags': restriction_flags,
-                    'affinity': affinity_label,
-                    'starlight_user': starlight_user,
-                    'creation_date': creation_date,
-                    'last_heroes_purchase': last_heroes_purchase,
-                    'mcl_champion_wins': mcl_wins,
-                    'win_count': win_count,
-                    'total_battles': total_battles,
-                    'win_rate': win_rate,
-                    'battle_points': bp if bp else None,
-                    'squad_motto': squad_motto if squad_motto != "N/A" else None,
-                    'diamonds': diamonds if diamonds else None,
-                    'starlight_count': starlight_count if starlight_count else None,
-                    'skin_history': skin_history_str if skin_history_str != "N/A" else None,
-                    'emblem_levels': emblem_levels if emblem_levels != "N/A" else None,
-                    'latest_skin_date': latest_skin_date,
-                    'latest_skin_id': latest_skin_id_str,
-                    'latest_skin_tier': latest_skin_tier,
-                },
-                'raw_data': player,
             },
         }
     except Exception:
@@ -1150,14 +733,22 @@ class GameConnection(BaseConnection):
         return None
 
 
+def _role_detail_from_info(role_id: int, zone_id: int, role_info: Dict) -> Dict:
+    return {0: [{
+        0: role_id, 1: zone_id,
+        2: role_info.get(2, 'Unknown'), 3: role_info.get(3, 0),
+        8: role_info.get(6), 95: role_info.get(15),
+        83: role_info.get(10, 0),
+    }]}
+
+
 def get_player_info(
     guid: int,
     session: str,
     device_manager: DeviceManager,
     max_device_retries: int = 20,
 ) -> Optional[Dict]:
-    """2-stage lookup: (1) resolve (guid, session) -> (role_id, zone_id) via 88-char resolver,
-    (2) fetch full role_detail/role_info via real character devices in devices.txt."""
+    """Fast lookup ONLY for Game ID (role_id, zone_id), skin count, and rank. Use full_info.py for full profile."""
     result = None
     role_id, zone_id = None, None
     deadline = time.monotonic() + 13.5  # ponytail: exit before browser.py 15s wait_for so executor threads never leak
@@ -1179,6 +770,12 @@ def get_player_info(
                     rid, zid = rconn.get_highest_level_role(cand)
                     if rid:
                         result, role_id, zone_id = cand, rid, zid
+                        # Fast path: query basic role_info (ID, skin, rank) on same open connection (0 extra TCP handshake)
+                        ri = rconn.get_role_info(rid, zid)
+                        if ri and (ri.get(6) is not None or ri.get(10) is not None):
+                            pd = extract_player_data(_role_detail_from_info(rid, zid, ri), ri, 0)
+                            if pd:
+                                return pd
                         break
             if role_id:
                 break
@@ -1212,37 +809,21 @@ def get_player_info(
                 conn.cleanup()
                 continue
 
-            if not conn.get_game_server() or not conn.connect_to_game_server():
+            if not conn.get_game_server() or not conn.connect_to_game_server(deadline=deadline):
                 conn.cleanup()
                 continue
 
-            role_detail = conn.get_role_detail(role_id)
             role_info = conn.get_role_info(role_id, zone_id)
+            has_core = bool(role_info and (role_info.get(6) is not None or role_info.get(10) is not None))
+            role_detail = _role_detail_from_info(role_id, zone_id, role_info) if has_core else conn.get_role_detail(role_id)
             if not role_detail:
-                if not role_info:
-                    conn.cleanup()
-                    continue
-                role_detail = {0: [{
-                    0: role_id, 1: zone_id,
-                    2: role_info.get(2, 'Unknown'), 3: role_info.get(3, 0),
-                    8: role_info.get(6), 95: role_info.get(15),
-                    83: role_info.get(10, 0),
-                }]}
+                conn.cleanup()
+                continue
 
             player_data = extract_player_data(role_detail, role_info, 0)
-            if not player_data:
-                conn.cleanup()
-                continue
-
-            v2l = 'Yes' if result.get(13, 0) == 1 else 'No'
-            player_data['data']['security_info']['v2l_status'] = v2l
-            player_data['v2l_status'] = v2l
-            player_data['device_used'] = device_id
-            player_data['attempts'] = attempt
-
             conn.cleanup()
-            return player_data
-
+            if player_data:
+                return player_data
         except Exception:
             if conn:
                 conn.cleanup()
