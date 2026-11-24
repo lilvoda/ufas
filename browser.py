@@ -556,34 +556,31 @@ def render_dashboard(force: bool = False):
     if st == 'RUNNING':
         _PERF.maybe_alert()
     is_drop, drop_tag, _, _, _, _ = _PERF.evaluate()
-    clock_str = now()[11:]
+    uptime_str = f"{el // 3600:02d}:{(el % 3600) // 60:02d}:{el % 60:02d}"
     if st == 'WAF_WAIT':
         st_txt = f"{c(RED)}{D_DOT} WAF WAIT{W}"
-        net_txt = f"{c(RED)}WAF ROTATE{W}"
     elif st == 'REFRESH':
         st_txt = f"{c(CYAN)}{D_DOT} REFRESH 1K{W}"
-        net_txt = f"{c(CYAN)}RELOADING{W}"
     elif st == 'DONE':
         st_txt = f"{c(GREEN)}{D_DOT} FINISHED{W}"
-        net_txt = f"{c(GREEN)}DONE{W}"
     elif is_drop:
         st_txt = f"{c(GOLD)}{D_DOT} DROP:{drop_tag}{W}"
-        net_txt = f"{c(GOLD)}DROP:{drop_tag}{W}"
     else:
         st_txt = f"{c(GREEN)}{D_DOT} ACTIVE{W}"
-        net_txt = f"{c(GREEN)}HEALTHY{W}"
 
     w_live, w_tot = stats['workers'], stats.get('workers_total', stats['workers'])
     streams = w_live * (2 if TWO_TAB else 1)
     q_str = _fmt_bytes(stats['bytes_used'])
+    bw_kbps = stats['bytes_used'] / max(now_t - stats['start'], 1.0) / 1024.0
+    bw_txt = f"{c(GOLD)}{q_str}{W} {c(GRAY)}({bw_kbps:.1f} KB/s){W}"
     mode_tag = f"{'2-Tab' if TWO_TAB else '1-Tab'} {'Proxy' if PROXY_ENABLED else 'Direct'}"
 
     out_lines = [f"{c(BC)}{BT}{BH * (W_OUT - 2)}{BTR}{W}"]
 
-    # Header bar: ◆ MLBB v9.0 - @Cloak     ● ACTIVE   18:05:27
-    hdr_r = f"{st_txt}   {c(GRAY)}{clock_str}{W}" if W_IN >= 48 else st_txt
+    # Header bar: ◆ Seeker v1 - @lil_voda     ● ACTIVE   01:00:00
+    hdr_r = f"{st_txt}   {c(GRAY)}{uptime_str}{W}" if W_IN >= 48 else st_txt
     hdr_l = _pad(
-        f"{c(WHITE)}{D_DIA} {BD}MLBB v9.0{W} {c(GRAY)}-{W} {c(CYAN)}{stats.get('engine_label', '@Cloak')}{W}",
+        f"{c(WHITE)}{D_DIA} {BD}Seeker v1{W} {c(GRAY)}-{W} {c(CYAN)}{stats.get('engine_label', '@lil_voda')}{W}",
         max(1, W_IN - _vis_len(hdr_r)),
     )
     out_lines.append(_box_line(f"{hdr_l}{hdr_r}", W_OUT, BC))
@@ -656,7 +653,7 @@ def render_dashboard(force: bool = False):
             (f" {c(GREEN)}{D_TRI} Valid{W}",     f"{c(GREEN)}{stats['valid']:>5,}{W}  {c(GRAY)}({v_rate_ck:4.1f}%){W}",
              f" {c(CYAN)}{D_CDIA} Workers{W}",  f"{c(CYAN)}{w_live}/{w_tot}{W} {c(GRAY)}({streams} st){W}"),
             (f" {c(RED)}{D_TRI} Invalid{W}",     f"{c(RED)}{stats['invalid']:>5,}{W}  {c(GRAY)}({i_pct:4.1f}%){W}",
-             f" {c(RED)}{D_DOT} Net/Perf{W}",   net_txt),
+             f" {c(CYAN)}{D_DOT} Bandwith{W}",   bw_txt),
             (f" {c(GOLD)}{D_DIA} 2FA / OTP{W}",  f"{c(GOLD)}{stats['otp']:>5,}{W}  {c(GRAY)}({o_rate_ck:4.1f}%){W}",
              f" {c(GREEN)}{D_TRI} Speed{W}",    f"{c(GREEN)}{rate:.1f}/s{W}"),
             (f" {c(GRAY)}{D_CDIA} Error{W}",     f"{c(GRAY)}{stats['error']:>5,}{W}  {c(GRAY)}({e_pct:4.1f}%){W}",
