@@ -11,16 +11,27 @@ if exist ".venv\Scripts\python.exe" (
 "%PY%" gen\gen.py %* || goto :err
 
 if not exist "input\" goto :nochange
-git add -- input/ || goto :err
+git rev-parse --is-inside-work-tree >nul 2>&1 || goto :nochange
+for /f "delims=" %%B in ('git rev-parse --abbrev-ref HEAD 2^>nul') do set "CUR_BR=%%B"
+if "%CUR_BR%"=="" set "CUR_BR=main"
+
+git add -- input/ || goto :gitwarn
 git diff --cached --quiet -- input/
-if errorlevel 2 goto :err
+if errorlevel 2 goto :gitwarn
 if not errorlevel 1 goto :nochange
 
-echo [*] Commit ^& push folder input/...
-git commit -m "update input combos" -- input/ || goto :err
-git pull --rebase --autostash origin main || goto :err
-git push origin main || goto :err
+echo [*] Pull ^& push folder input/ ke origin/%CUR_BR%...
+git pull --rebase --autostash origin "%CUR_BR%" || (
+    git rebase --abort >nul 2>&1
+    goto :gitwarn
+)
+git commit -m "update input combos" -- input/ || goto :gitwarn
+git push origin "%CUR_BR%" || goto :gitwarn
 echo [OK] input/ berhasil di-commit ^& push.
+goto :end
+
+:gitwarn
+echo [!] gen.py selesai, namun auto-push git dilewati/gagal.
 goto :end
 
 :nochange

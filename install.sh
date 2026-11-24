@@ -25,7 +25,7 @@ if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
 fi
 
 # 1. System base packages (Python3 + venv + pip) — hanya jika belum lengkap dan punya akses root/sudo
-if ! command -v python3 >/dev/null 2>&1 || ! python3 -m venv --help >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
+if ! command -v python3 >/dev/null 2>&1 || ! python3 -c "import ensurepip" >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
     if [ "$(id -u)" -eq 0 ] || [ -n "$SUDO" ]; then
         if command -v apt-get >/dev/null 2>&1; then
             echo "[*] Memasang paket dasar apt (python3, venv, pip, curl)..."
@@ -59,19 +59,26 @@ python -m pip install --upgrade cloakbrowser playwright pycryptodome zstandard c
 # 3. Dependensi library OS untuk Chromium/CloakBrowser (Linux)
 if [ "$(uname -s)" = "Linux" ]; then
     echo "[*] Memasang library sistem Chromium (playwright install-deps)..."
-    if ! python -m playwright install-deps chromium && [ -n "$SUDO" ]; then
-        $SUDO env "PATH=$PATH" python -m playwright install-deps chromium || true
+    if ! python -m playwright install-deps chromium; then
+        if [ -n "$SUDO" ]; then
+            $SUDO env "PATH=$PATH" python -m playwright install-deps chromium
+        else
+            echo "[!] Gagal memasang dependency OS Chromium (install-deps)."
+            exit 1
+        fi
     fi
 fi
 
-# 4. Unduh binary CloakBrowser Pro memakai key sementara, lalu tarik kembali key dari disk
+# 4. Unduh binary CloakBrowser Pro memakai key sementara, lalu tarik kembali key dari disk (dijamin cleanup trap)
+CACHE_DIR="${CLOAKBROWSER_CACHE_DIR:-$HOME/.cloakbrowser}"
+cleanup_license() {
+    rm -f "$CACHE_DIR/license.key" "$CACHE_DIR/.license_cache" "$CACHE_DIR/.license_cache.tmp" "$CACHE_DIR/.free_claim" 2>/dev/null || true
+    unset CLOAKBROWSER_LICENSE_KEY 2>/dev/null || true
+}
+trap cleanup_license EXIT
 echo "[*] Mengunduh binary CloakBrowser Pro..."
 CLOAKBROWSER_LICENSE_KEY="$LIC_KEY" python -m cloakbrowser install
-
-# Tarik file license/cache agar aman pindah device (key kembali disuntik otomatis tiap run)
-CACHE_DIR="${CLOAKBROWSER_CACHE_DIR:-$HOME/.cloakbrowser}"
-rm -f "$CACHE_DIR/license.key" "$CACHE_DIR/.license_cache" "$CACHE_DIR/.license_cache.tmp" "$CACHE_DIR/.free_claim" 2>/dev/null || true
-unset CLOAKBROWSER_LICENSE_KEY
+cleanup_license
 
 # 5. Verifikasi cepat
 echo "[*] Menjalankan verifikasi..."

@@ -35,7 +35,7 @@ assert "_acquire_instance_lock" in src_main, "Single-instance lock missing"
 
 # 5. info.py + devices.txt lookup active
 assert browser.INFO_OK is True, f"info.py import failed: {browser.INFO_IMPORT_ERR}"
-dm = browser.DeviceManager("devices.txt")
+dm = browser.DeviceManager(os.path.join(os.path.dirname(os.path.abspath(__file__)), "devices.txt"))
 assert len(dm.devices) >= 80, f"devices.txt should load all valid devices, got {len(dm.devices)}"
 import info as _info
 assert "game_version" in inspect.getsource(_info.GameConnection), "Dynamic game_version capture missing"
@@ -43,6 +43,10 @@ assert "game_version" in inspect.getsource(_info.GameConnection), "Dynamic game_
 # 6. Ephemeral CloakBrowser license activate/withdraw per run
 with tempfile.TemporaryDirectory() as tmpd:
     old_cdir = os.environ.get("CLOAKBROWSER_CACHE_DIR")
+    old_lkey = os.environ.get("CLOAKBROWSER_LICENSE_KEY")
+    old_cfg = browser._CONFIGURED_LICENSE_KEY
+    old_act = browser._ACTIVE_LICENSE_KEY
+    old_sess = browser._LICENSE_SESSION_ACTIVE
     os.environ["CLOAKBROWSER_CACHE_DIR"] = tmpd
     try:
         for fn in ("license.key", ".license_cache", ".free_claim"):
@@ -59,6 +63,13 @@ with tempfile.TemporaryDirectory() as tmpd:
             os.environ.pop("CLOAKBROWSER_CACHE_DIR", None)
         else:
             os.environ["CLOAKBROWSER_CACHE_DIR"] = old_cdir
+        if old_lkey is None:
+            os.environ.pop("CLOAKBROWSER_LICENSE_KEY", None)
+        else:
+            os.environ["CLOAKBROWSER_LICENSE_KEY"] = old_lkey
+        browser._CONFIGURED_LICENSE_KEY = old_cfg
+        browser._ACTIVE_LICENSE_KEY = old_act
+        browser._LICENSE_SESSION_ACTIVE = old_sess
 
 src_launch = inspect.getsource(browser.launch_browser_smart)
 assert "license_key=" in src_launch
@@ -133,12 +144,139 @@ assert _info.extract_player_data({1: "no_zero_key"}) is None, "extract_player_da
 assert "os.path.join(BASE, 'output', _stem)" in src_main, "Per-input resume OUTPUT_DIR missing"
 assert browser.WAVE_REFRESH_EVERY == 1000 and "wave_limit" in src_main and "wave_limit" in src_worker, "1k wave worker refresh missing"
 assert "_STATIC_CACHE.clear()" not in src_main and "_TUNNEL_BLACKLIST.clear()" not in src_main, "1k refresh must keep RAM JS cache & tunnel blacklist"
-assert "stale_browser=browser" in src_worker, "run_worker relaunches must pass stale_browser"
+assert "stale_browser=" in src_worker, "run_worker relaunches must pass stale_browser"
+assert "_kill_driver_tree" in src_main, "ensure_browser must kill PID tree without withdrawing Cloak license mid-run"
+assert "aborted_on_errors" in src_main and "checked_before" in src_main, "1k wave refresh must detect stall/abort cleanly"
+assert browser.parse_proxy("user:123456:1.2.3.4:8080") == {"server": "http://1.2.3.4:8080", "username": "user", "password": "123456"}
+assert browser.rotated_user("tok__cr.id,th", session_id="w0e0")["region"] in ("ID", "TH"), "Explicit __cr. regions must be honored with session_id"
+assert "proxy_407" in src_login and "Client_InvalidPasswordRule" in src_login, "Fast 407 & client password validation must be active"
+assert "isinstance(res, str)" in inspect.getsource(_info.BaseConnection.recv_data), "recv_data must accept UTF-8-decoded binary payloads"
 with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as tf:
-    tf.write("a:1\na:1\nb:2\n")
+    tf.write("Alice:Pass1\nalice:Pass1\nalice:pass1\nb:2\n")
     _tfp = tf.name
 try:
-    assert browser.load_combos(_tfp) == [("a", "1"), ("b", "2")], "load_combos must deduplicate pairs"
+    assert browser.load_combos(_tfp) == [("Alice", "Pass1"), ("alice", "pass1"), ("b", "2")], "load_combos must keep password case-sensitivity"
 finally:
     os.remove(_tfp)
+
+# 9. Behavioral 1k wave refresh + HTTP 502/407 + fast Client_InvalidPasswordRule tests
+import asyncio as _asyncio, sys as _sys_t
+
+async def _run_behavioral_checks():
+    # A. do_login_via_browser: 502 HTML -> PROXY_HTTP_ERR (not WAF), 407 -> proxy_407, client validation -> INVALID
+    class _FakeResp:
+        def __init__(self, status, url="https://accountmtapi.mobilelegends.com/", method="POST", post_data='{"op":"new_login_pwd","params":{"account":"a1"}}'):
+            self.status = status
+            self.url = url
+            class _Req:
+                pass
+            self.request = _Req()
+            self.request.method = method
+            self.request.post_data = post_data
+
+        async def text(self):
+            return "<html><body>502 Bad Gateway</body></html>"
+
+    class _FakePage:
+        def __init__(self, mode):
+            self.mode = mode
+            self.url = browser.LOGIN_PAGE
+            self._ls = {}
+
+        def on(self, ev, fn):
+            self._ls.setdefault(ev, []).append(fn)
+
+        def remove_listener(self, ev, fn):
+            if ev in self._ls and fn in self._ls[ev]:
+                self._ls[ev].remove(fn)
+
+        async def evaluate(self, js, arg=None):
+            if "formComp.submit" in js:
+                if self.mode in ("502", "407"):
+                    for fn in list(self._ls.get("response", [])):
+                        r = fn(_FakeResp(int(self.mode)))
+                        if _asyncio.iscoroutine(r):
+                            await r
+                return "OK"
+            if "errEl" in js:
+                return self.mode == "client_invalid"
+            return False
+
+    k502, d502 = await browser.do_login_via_browser(_FakePage("502"), None, "a1", "pw1")
+    assert k502 == "ERR" and d502.get("message") == "PROXY_HTTP_ERR", f"502 HTML misclassified: {k502} {d502}"
+    k407, d407 = await browser.do_login_via_browser(_FakePage("407"), None, "a1", "pw1")
+    assert k407 == "ERR" and d407.get("proxy_407") is True, f"407 not flagged: {k407} {d407}"
+    kci, dci = await browser.do_login_via_browser(_FakePage("client_invalid"), None, "a1", "bad")
+    assert kci == "INVALID" and dci.get("message") == "Client_InvalidPasswordRule", f"Expected fast client invalid, got {kci} {dci}"
+
+    # B. Multi-wave restart every WAVE_REFRESH_EVERY accounts (simulated with wave=3 over 7 combos)
+    with tempfile.TemporaryDirectory() as td:
+        cfp = os.path.join(td, "c7.txt")
+        outd = os.path.join(td, "out")
+        with open(cfp, "w", encoding="utf-8") as cf:
+            for i in range(7):
+                cf.write(f"u{i}:p{i}\n")
+        orig_vals = (
+            browser.WAVE_REFRESH_EVERY,
+            browser.launch_browser_smart,
+            browser.run_worker,
+            browser.withdraw_cloak_license,
+            browser.activate_cloak_license,
+            list(_sys_t.argv),
+            browser._TUI_ACTIVE,
+        )
+        launches = []
+        closed = []
+        withdraws = []
+        seen_waves = []
+
+        class _FakeB:
+            def __init__(self, idx):
+                self.idx = idx
+            def is_connected(self):
+                return True
+            async def close(self):
+                closed.append(self.idx)
+
+        async def _fake_launch(headless=True, humanize=False):
+            b = _FakeB(len(launches))
+            launches.append(b.idx)
+            return b
+
+        async def _fake_worker(wid, combos, combo_q, b, dm, p_info, live_pool, ensure_browser=None, browser_state=None, acct_retries=None, wave_limit=0, wave_idx=0):
+            seen_waves.append((wave_idx, b.idx))
+            while not combo_q.empty() and (not wave_limit or browser.stats['checked'] < wave_limit):
+                u, p = combo_q.get_nowait()
+                browser.stats['checked'] += 1
+                browser.stats['invalid'] += 1
+                combo_q.task_done()
+
+        try:
+            browser.WAVE_REFRESH_EVERY = 3
+            browser.launch_browser_smart = _fake_launch
+            browser.run_worker = _fake_worker
+            browser.activate_cloak_license = lambda k="": "cb_testkey"
+            browser.withdraw_cloak_license = lambda: withdraws.append("withdrawn")
+            browser._LICENSE_SESSION_ACTIVE = True
+            for k_s in ('valid', 'invalid', 'otp', 'error', 'waf', 'checked', 'proxy_ctx', 'bytes_used'):
+                browser.stats[k_s] = 0
+            _sys_t.argv = ["browser.py", cfp, "--workers", "1", "--no-proxy", "--no-prompt", "--out", outd]
+            await browser.async_main()
+            assert browser.stats['checked'] == 7, f"Expected 7 checked across 3 waves, got {browser.stats['checked']}"
+            assert launches == [0, 1, 2], f"Expected 3 browser launches (1 + 2 wave refreshes), got {launches}"
+            assert seen_waves == [(0, 0), (1, 1), (2, 2)], f"Unexpected wave/browser sequence: {seen_waves}"
+            assert len(withdraws) == 1, f"License must only withdraw once at final exit, got {withdraws}"
+        finally:
+            (
+                browser.WAVE_REFRESH_EVERY,
+                browser.launch_browser_smart,
+                browser.run_worker,
+                browser.withdraw_cloak_license,
+                browser.activate_cloak_license,
+                _sys_t.argv,
+                browser._TUI_ACTIVE,
+            ) = orig_vals
+            browser._LICENSE_SESSION_ACTIVE = False
+
+_asyncio.run(_run_behavioral_checks())
 print("All hybrid browser stability, 2-tab, cache, license & lookup checks passed.")

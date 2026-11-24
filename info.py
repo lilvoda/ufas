@@ -908,6 +908,8 @@ class BaseConnection:
                 return None, None
 
             res = result.get(6) or result.get(5)
+            if isinstance(res, str):
+                res = res.encode('utf-8', errors='surrogateescape')
             if not res or not isinstance(res, bytes):
                 return cmd, None
 
@@ -995,8 +997,10 @@ class GameConnection(BaseConnection):
             pass
         return False
 
-    def connect_to_game_server(self, max_retries: int = 5) -> bool:
+    def connect_to_game_server(self, max_retries: int = 5, deadline: Optional[float] = None) -> bool:
         for attempt in range(max_retries):
+            if deadline is not None and time.monotonic() >= deadline:
+                break
             try:
                 self.cleanup()
                 self.host = self.game_server_host
@@ -1012,6 +1016,8 @@ class GameConnection(BaseConnection):
 
                 timeout_count = 0
                 while timeout_count < 2:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        break
                     cmd, ac_res = self.recv_data()
                     if cmd is None:
                         break
@@ -1021,15 +1027,15 @@ class GameConnection(BaseConnection):
                         timeout_count += 1
                         break
 
-                if attempt < max_retries - 1:
+                if attempt < max_retries - 1 and (deadline is None or time.monotonic() < deadline):
                     time.sleep(1)
             except Exception:
-                if attempt < max_retries - 1:
+                if attempt < max_retries - 1 and (deadline is None or time.monotonic() < deadline):
                     time.sleep(1)
         return False
 
     def get_account_info(self, guid: int, session: str,
-                         account_type: str = "and") -> Optional[SdpStruct]:
+                         account_type: str = "and", deadline: Optional[float] = None) -> Optional[SdpStruct]:
         try:
             payloads = [
                 SdpStruct({
@@ -1050,10 +1056,14 @@ class GameConnection(BaseConnection):
             ]
 
             for req in payloads:
+                if deadline is not None and time.monotonic() >= deadline:
+                    break
                 self.send_data(10207, req)
 
                 timeout_count = 0
                 while timeout_count < 2:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        break
                     cmd, res = self.recv_data()
                     if cmd is None or cmd == 20001:
                         break
@@ -1159,10 +1169,12 @@ def get_player_info(
         try:
             rconn = GameConnection(device_id=rdev, device_manager=device_manager)
             rconn.connect()
-            if not (rconn.login_to_login_server() and rconn.get_game_server() and rconn.connect_to_game_server()):
+            if not (rconn.login_to_login_server() and rconn.get_game_server() and rconn.connect_to_game_server(max_retries=2, deadline=deadline)):
                 continue
             for atype in ("and", "ios"):
-                cand = rconn.get_account_info(guid, session, atype)
+                if time.monotonic() >= deadline:
+                    break
+                cand = rconn.get_account_info(guid, session, atype, deadline=deadline)
                 if cand:
                     rid, zid = rconn.get_highest_level_role(cand)
                     if rid:
