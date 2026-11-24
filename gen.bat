@@ -4,14 +4,25 @@ cd /d "%~dp0"
 
 if exist ".venv\Scripts\python.exe" (
     set "PY=.venv\Scripts\python.exe"
+) else if exist ".venv_old\Scripts\python.exe" (
+    set "PY=.venv_old\Scripts\python.exe"
+) else if exist "..\muse-old-vpn\.venv_old\Scripts\python.exe" (
+    set "PY=..\muse-old-vpn\.venv_old\Scripts\python.exe"
 ) else (
     set "PY=python"
 )
 
-"%PY%" gen\gen.py %* || goto :err
+if exist "gen\gen.py" (
+    "%PY%" gen\gen.py %* || goto :err
+) else if exist "..\muse-gen\gen\gen.py" (
+    "%PY%" ..\muse-gen\gen\gen.py %* || goto :err
+) else (
+    echo [i] Generator lokal tidak ditemukan ^(gen\gen.py / ..\muse-gen\gen\gen.py^) - cek perubahan input/ saja.
+)
 
 if not exist "input\" goto :nochange
 git rev-parse --is-inside-work-tree >nul 2>&1 || goto :nochange
+git remote get-url origin >nul 2>&1 || goto :noremote
 for /f "delims=" %%B in ('git rev-parse --abbrev-ref HEAD 2^>nul') do set "CUR_BR=%%B"
 if "%CUR_BR%"=="" set "CUR_BR=main"
 
@@ -30,8 +41,12 @@ git push origin "%CUR_BR%" || goto :gitwarn
 echo [OK] input/ berhasil di-commit ^& push.
 goto :end
 
+:noremote
+echo [i] Remote origin belum diset ^(jalankan git remote add origin ^<url^>^) - push dilewati.
+goto :end
+
 :gitwarn
-echo [!] gen.py selesai, namun auto-push git dilewati/gagal.
+echo [!] Selesai, namun auto-push git dilewati/gagal.
 goto :end
 
 :nochange
