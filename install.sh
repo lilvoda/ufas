@@ -4,7 +4,7 @@ set -euo pipefail
 # MLBB Fast Checker v9.0 — First-time Setup (Linux / macOS / Termux proot-distro Ubuntu-Debian)
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
-KEY_DEFAULT="cb_3c59a9fa1a2841aeab3194b483542320"
+KEY_DEFAULT="cb_796b6fadb4cd45c79d7b27a458e7634f"
 LIC_KEY="${1:-${CLOAKBROWSER_LICENSE_KEY:-$KEY_DEFAULT}}"
 
 echo "[*] MLBB Fast Checker — First-time Installer"

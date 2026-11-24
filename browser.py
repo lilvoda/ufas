@@ -43,7 +43,7 @@ if _popped_cwd:
 _driver_pid = None
 _pw_instance = None
 
-CLOAKBROWSER_LICENSE_KEY_DEFAULT = "cb_3c59a9fa1a2841aeab3194b483542320"
+CLOAKBROWSER_LICENSE_KEY_DEFAULT = "cb_796b6fadb4cd45c79d7b27a458e7634f"
 _ACTIVE_LICENSE_KEY = ""
 _LICENSE_SESSION_ACTIVE = False
 
@@ -419,7 +419,7 @@ def render_dashboard(force: bool = False):
     if st == 'WAF_WAIT':
         badge = "\033[41;97m ! WAF / ROTATE \033[0m" if _COLOR_OK else "[! WAF]"
     elif st == 'REFRESH':
-        badge = "\033[46;30m ~ REFRESH 1K \033[0m" if _COLOR_OK else "[~ REFRESH]"
+        badge = f"\033[46;30m {stats.get('refresh_label', '~ REFRESH 1K')} \033[0m" if _COLOR_OK else "[~ REFRESH]"
     elif st == 'DONE':
         badge = "\033[42;30m + FINISHED \033[0m" if _COLOR_OK else "[+ DONE]"
     else:
@@ -432,7 +432,7 @@ def render_dashboard(force: bool = False):
 
     out_lines = []
     title = (
-        f" * {c(PURPLE)}{BD}MLBB FAST CHECKER v9.0{W} {c(CYAN)}@BrowserEngine{W} * "
+        f" * {c(PURPLE)}{BD}MLBB FAST CHECKER v9.0{W} {c(CYAN)}{stats.get('engine_label', '@BrowserEngine')}{W} * "
         if W_OUT >= 54 else
         f" {c(PURPLE)}{BD}MLBB CHECKER v9.0{W} "
     )

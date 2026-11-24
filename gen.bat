@@ -8,8 +8,7 @@ if exist ".venv\Scripts\python.exe" (
     set "PY=python"
 )
 
-"%PY%" gen\gen.py %*
-if errorlevel 1 goto :err
+"%PY%" gen\gen.py %* || goto :err
 
 if not exist "input\" goto :nochange
 git add -- input/ || goto :err

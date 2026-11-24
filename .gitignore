@@ -6,5 +6,8 @@ gen/
 combo_seen.db*
 _test_*/
 .chromium_cache/
+.http_cache/
 graphify-out/
 *.log
+backup_cloak/
+archive/
